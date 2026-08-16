@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_USER: antigen
+      POSTGRES_PASSWORD: antigen
+      POSTGRES_DB: antigen
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

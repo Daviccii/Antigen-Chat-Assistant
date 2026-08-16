@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+psycopg2-binary
+SQLAlchemy
+pgvector
+openai
+numpy
