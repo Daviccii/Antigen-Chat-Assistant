@@ -12,8 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime
 
-from .models import Conversation, Message
-from .models import Memory
+from .models import Conversation, Message, Memory
 from .config import settings
 import httpx
 from sqlalchemy import text
@@ -23,6 +22,27 @@ import logging
 logger = logging.getLogger(__name__)
 from .models import Memory
 
+# Local embedding model served by Ollama — pull it once with:
+#   ollama pull nomic-embed-text
+# Produces 768-dim vectors, matching Memory.embedding's column type in
+# models.py. If you change this, the column dimension needs to match and
+# existing embeddings need regenerating.
+EMBEDDING_MODEL = "nomic-embed-text"
+
+
+def _get_local_embedding(text_input: str) -> list[float] | None:
+    """Call Ollama's local embeddings endpoint. Returns None on failure
+    rather than raising, so callers can decide how to degrade."""
+    url = f"{settings.OLLAMA_BASE_URL}/api/embeddings"
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, json={"model": EMBEDDING_MODEL, "prompt": text_input})
+            resp.raise_for_status()
+            return resp.json().get("embedding")
+    except Exception as e:
+        logger.warning("Local embedding request failed: %s", e)
+        return None
+
 
 def list_conversations(
     db: Session,
@@ -31,6 +51,7 @@ def list_conversations(
     search: Optional[str] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    user_id: Optional[int] = None,
 ) -> Tuple[List[Dict], Dict]:
     """Return a page of conversation summaries and pagination metadata.
 
@@ -41,6 +62,7 @@ def list_conversations(
       search: optional substring to search in messages (case-insensitive)
       date_from: optional ISO datetime to filter conversation.created_at >= date_from
       date_to: optional ISO datetime to filter conversation.created_at <= date_to
+      user_id: optional user ID to filter conversations by user
 
     Returns:
       (items, meta) where items is a list of dicts and meta contains pagination info.
@@ -53,6 +75,10 @@ def list_conversations(
 
     # Base query for conversations
     q = db.query(Conversation)
+
+    # Filter by user if provided
+    if user_id:
+        q = q.filter(Conversation.user_id == user_id)
 
     # If searching message text, join Message and filter by ILIKE.
     if search:
@@ -83,11 +109,27 @@ def list_conversations(
             .limit(1)
             .first()
         )
+        # First user message doubles as a readable title, without needing a
+        # dedicated `title` column (and the migration that would require).
+        first_user_msg = (
+            db.query(Message)
+            .filter(Message.conversation_id == c.id, Message.role == "user")
+            .order_by(Message.created_at.asc())
+            .limit(1)
+            .first()
+        )
+        title = None
+        if first_user_msg and first_user_msg.content:
+            title = first_user_msg.content.strip()
+            if len(title) > 60:
+                title = title[:60].rsplit(" ", 1)[0] + "…"
+
         results.append(
             {
                 "id": c.id,
                 "created_at": c.created_at.isoformat(),
                 "last_message": last.content if last else None,
+                "title": title,
             }
         )
 
@@ -127,12 +169,12 @@ def delete_conversation(db: Session, conversation_id: int) -> bool:
     return True
 
 
-def create_memory(db: Session, *, type: str, content: str, key: str | None = None, source: str | None = None, tags: str | None = None) -> Memory:
+def create_memory(db: Session, *, type: str, content: str, key: str | None = None, source: str | None = None, tags: str | None = None, user_id: int | None = None) -> Memory:
     """Create and persist a memory record.
 
     Returns the Memory ORM instance.
     """
-    mem = Memory(type=type, key=key, content=content, source=source, tags=tags)
+    mem = Memory(type=type, key=key, content=content, source=source, tags=tags, user_id=user_id)
     db.add(mem)
     db.commit()
     db.refresh(mem)
@@ -174,11 +216,13 @@ def list_memories(
     tags: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    user_id: int | None = None,
 ) -> tuple[list[dict], dict]:
     """List memories with pagination and simple filtering.
 
     - `search` matches `content` or `key` with ILIKE.
     - `tags` is a comma-separated list and will be matched with simple substring contains.
+    - `user_id` filters memories by user.
     """
     if page < 1:
         raise ValueError("page must be >= 1")
@@ -186,6 +230,11 @@ def list_memories(
         raise ValueError("page_size must be between 1 and 500")
 
     q = db.query(Memory)
+    
+    # Filter by user if provided
+    if user_id:
+        q = q.filter(Memory.user_id == user_id)
+    
     if type:
         q = q.filter(Memory.type == type)
     if search:
@@ -229,67 +278,44 @@ def semantic_search_memories(
     top_k: int = 10,
     type: str | None = None,
     tags: str | None = None,
+    user_id: int | None = None,
 ):
-    """Perform semantic search over Memories using OpenAI embeddings and pgvector nearest-neighbor search.
-
-    Returns a list of memory dicts with distance metadata.
+    """Semantic search over Memories using a local Ollama embedding model
+    (nomic-embed-text) and pgvector nearest-neighbor search. Fully local —
+    no external API calls, no API key needed.
     """
-    if not settings.OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY not configured")
+    emb = _get_local_embedding(query_text)
+    if not emb:
+        raise ValueError(
+            "Could not generate a local embedding for the query — is Ollama running "
+            f"with `{EMBEDDING_MODEL}` pulled? (ollama pull {EMBEDDING_MODEL})"
+        )
 
-    # Create embedding for the query via OpenAI Embeddings API
-    url = "https://api.openai.com/v1/embeddings"
-    headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"input": query_text, "model": "text-embedding-3-small"}
+    vec_literal = "[" + ",".join(f"{float(x):.12f}" for x in emb) + "]"
 
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        emb = resp.json()["data"][0]["embedding"]
+    # Only rank rows that actually have an embedding yet — a freshly created
+    # memory whose background embedding job hasn't run should be skipped
+    # rather than sorting unpredictably against a NULL vector.
+    where_clauses = ["embedding IS NOT NULL"]
+    params = {"limit": int(top_k)}
+    if user_id:
+        where_clauses.append("user_id = :user_id")
+        params["user_id"] = user_id
+    if type:
+        where_clauses.append("type = :type")
+        params["type"] = type
+    if tags:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        for i, t in enumerate(tag_list):
+            key = f"tag_{i}"
+            where_clauses.append(f"tags ILIKE :{key}")
+            params[key] = f"%{t}%"
 
-# Semantic search requires pgvector; fall back to a simple content-based search if the
-        # embedding column is not configured as a vector type.
-        if not hasattr(Memory.__table__.c, "embedding") or Memory.__table__.c.embedding.type.__class__.__name__ != "VECTOR":
-            q = db.query(Memory)
-            if type:
-                q = q.filter(Memory.type == type)
-            if tags:
-                for t in [t.strip() for t in tags.split(",") if t.strip()]:
-                    q = q.filter(Memory.tags.ilike(f"%{t}%"))
-            rows = q.order_by(Memory.created_at.desc()).limit(top_k).all()
-            return [
-                {
-                    "id": m.id,
-                    "type": m.type,
-                    "key": m.key,
-                    "content": m.content,
-                    "source": m.source,
-                    "tags": m.tags,
-                    "created_at": m.created_at.isoformat(),
-                    "updated_at": m.updated_at.isoformat() if m.updated_at else None,
-                    "distance": None,
-                }
-                for m in rows
-            ]
-
-        vec_literal = "[" + ",".join(f"{float(x):.12f}" for x in emb) + "]"
-
-        where_clauses = []
-        params = {"limit": int(top_k)}
-        if type:
-            where_clauses.append("type = :type")
-            params["type"] = type
-        if tags:
-            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-            for i, t in enumerate(tag_list):
-                key = f"tag_{i}"
-                where_clauses.append(f"tags ILIKE :{key}")
-                params[key] = f"%{t}%"
-
-        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    where_sql = "WHERE " + " AND ".join(where_clauses)
 
     sql = text(
-        f"SELECT id, type, key, content, source, tags, created_at, updated_at, embedding <-> '{vec_literal}' AS distance FROM memories {where_sql} ORDER BY distance ASC LIMIT :limit"
+        f"SELECT id, type, key, content, source, tags, created_at, updated_at, embedding <-> '{vec_literal}' AS distance "
+        f"FROM memories {where_sql} ORDER BY distance ASC LIMIT :limit"
     )
 
     rows = db.execute(sql, params).fetchall()
@@ -313,15 +339,12 @@ def semantic_search_memories(
 
 
 def generate_and_store_embedding(memory_id: int) -> None:
-    """Generate an embedding for a memory and store it in the DB.
+    """Generate a local embedding for a memory and store it in the DB.
 
     This function creates its own DB session and is safe to run in a
-    background task. Errors are logged and do not raise to callers.
+    background task (or via asyncio.to_thread from async code). Errors are
+    logged and do not raise to callers.
     """
-    if not settings.OPENAI_API_KEY:
-        logger.debug("OPENAI_API_KEY not set; skipping embedding generation")
-        return
-
     db = SessionLocal()
     try:
         mem = db.get(Memory, memory_id)
@@ -332,37 +355,19 @@ def generate_and_store_embedding(memory_id: int) -> None:
             logger.debug("Memory id %s already has embedding; skipping", memory_id)
             return
 
-        url = "https://api.openai.com/v1/embeddings"
-        headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}", "Content-Type": "application/json"}
-        payload = {"input": mem.content, "model": "text-embedding-3-small"}
-
-        # Retry with exponential backoff for transient errors
-        max_attempts = 5
-        backoff_base = 1.0
         emb = None
+        max_attempts = 3
         for attempt in range(1, max_attempts + 1):
-            try:
-                with httpx.Client(timeout=30.0) as client:
-                    resp = client.post(url, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    emb = resp.json()["data"][0]["embedding"]
-                    break
-            except Exception as e:
-                wait = backoff_base * (2 ** (attempt - 1))
-                logger.warning("Embedding attempt %s failed for memory %s: %s; retrying in %s seconds", attempt, memory_id, e, wait)
-                try:
-                    import time
+            emb = _get_local_embedding(mem.content)
+            if emb:
+                break
+            logger.warning("Embedding attempt %s failed for memory %s; retrying", attempt, memory_id)
 
-                    time.sleep(wait)
-                except Exception:
-                    pass
-
-        if emb is None:
-            logger.error("Failed to obtain embedding after %s attempts for memory %s", max_attempts, memory_id)
+        if not emb:
+            logger.error("Failed to obtain local embedding after %s attempts for memory %s", max_attempts, memory_id)
             return
 
         try:
-            # Assign the embedding (pgvector SQLAlchemy accepts list of floats)
             mem.embedding = emb
             db.add(mem)
             db.commit()
@@ -374,18 +379,22 @@ def generate_and_store_embedding(memory_id: int) -> None:
         db.close()
 
 
-def batch_generate_embeddings(limit: int | None = None) -> int:
+def batch_generate_embeddings(limit: int | None = None, user_id: int | None = None) -> int:
     """Batch generate embeddings for memories missing them.
 
     Args:
       limit: optional max number of memories to process in this batch.
+      user_id: optional user ID to filter memories by user.
 
     Returns:
       Number of memories processed (attempted).
     """
     db = SessionLocal()
     try:
-        q = db.query(Memory).filter(Memory.embedding == None).order_by(Memory.created_at.asc())
+        q = db.query(Memory).filter(Memory.embedding == None)
+        if user_id:
+            q = q.filter(Memory.user_id == user_id)
+        q = q.order_by(Memory.created_at.asc())
         if limit:
             q = q.limit(limit)
         to_process = q.all()
