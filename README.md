@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Antigen — Local Chat Assistant
 
 Scaffold for a local chat assistant using FastAPI (backend), React + Vite (frontend), and Postgres (optional via Docker Compose).
@@ -67,7 +66,3 @@ curl -X POST http://localhost:8000/memories/semantic_search \
 ```
 
 The backend will compute an embedding for the query and return relevant memories ordered by similarity.
-
-=======
-# Antigen-Chat-Assistant
->>>>>>> 17f19998f14081b5b147fb5c9501da97b161d3d6

@@ -11,7 +11,9 @@ import asyncio
 from .config import settings
 from .db import SessionLocal, init_db
 from sqlalchemy.orm import Session
-from .models import Conversation, Message as MessageModel, UserRole, User, Memory
+from .models import Conversation, Message as MessageModel, UserRole, User, Memory, Project
+from .memory_service import MemoryService, MemoryCategory, MemoryImportance, MemorySource, MemoryStatus
+from .context_engine import ContextEngine
 from .services import (
     list_conversations as svc_list_conversations,
     delete_conversation as svc_delete_conversation,
@@ -27,6 +29,7 @@ from .services import (
 from .auth import get_current_active_user, require_owner, create_access_token
 from .auth_service import AuthService
 from .voice import router as voice_router
+from .time_service import TimeService
 
 app = FastAPI(title="Antigen API")
 
@@ -42,17 +45,17 @@ app.add_middleware(
 
 app.include_router(voice_router)
 
-def build_system_prompt(user: User, db: Session, query_text: str | None = None) -> str:
+def build_system_prompt(user: User, db: Session, query_text: str | None = None, conversation_id: int | None = None) -> str:
     """Personalized system prompt for the current user, refreshed on every
     turn (not just new conversations) so name-addressing and memory recall
     stay present throughout a conversation, not just the opening message.
 
-    When query_text is given (the user's current message), memory recall
-    uses real semantic search — relevance-ranked against pgvector using a
-    local Ollama embedding model, not just "most recent." Falls back to
-    plain recency (list_memories) if semantic search errors for any reason
-    (e.g. the embedding model isn't pulled yet), so a hiccup here never
-    breaks the chat response itself.
+    Uses the Phase 3 Context Engine to build comprehensive context including:
+    - Authoritative time context
+    - User profile and preferences
+    - Relevant long-term memories
+    - Project context
+    - Conversation context
     """
     name = user.display_name or user.username
     lines = [
@@ -62,26 +65,32 @@ def build_system_prompt(user: User, db: Session, query_text: str | None = None) 
         f"private assistant rather than a generic chatbot.",
     ]
 
-    memories = []
+    # Use Context Engine for comprehensive context
     try:
-        if query_text:
-            memories = svc_semantic_search(db=db, query_text=query_text, top_k=6, user_id=user.id)
-        else:
-            memories, _meta = svc_list_memories(db=db, page=1, page_size=8, user_id=user.id)
-    except Exception:
-        try:
-            memories, _meta = svc_list_memories(db=db, page=1, page_size=8, user_id=user.id)
-        except Exception:
-            memories = []
-
-    if memories:
-        lines.append(f"\nWhat you currently know about {name} (weave in naturally; don't recite this list):")
-        for m in memories:
-            snippet = (m.get("content") or "").strip()
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "..."
-            if snippet:
-                lines.append(f"- {snippet}")
+        context = ContextEngine.build_full_context(
+            db=db,
+            user=user,
+            query_text=query_text,
+            conversation_id=conversation_id
+        )
+        
+        # Format context for LLM
+        context_text = ContextEngine.format_context_for_llm(context)
+        if context_text:
+            lines.append(f"\n{context_text}")
+    except Exception as e:
+        # Fallback to basic time context if context engine fails
+        print(f"Context engine error: {e}")
+        user_timezone = getattr(user, 'timezone', None) or "Africa/Nairobi"
+        time_context = TimeService.get_time_context(user_timezone)
+        lines.append(
+            f"\nCurrent time context (authoritative - do not calculate dates/times yourself):"
+        )
+        lines.append(f"- Local time: {time_context['local']} ({time_context['timezone']})")
+        lines.append(f"- UTC time: {time_context['utc']}")
+        lines.append(f"- Date: {time_context['date']}")
+        lines.append(f"- Weekday: {time_context['weekday']}")
+        lines.append(f"- Time: {time_context['time']}")
 
     return "\n".join(lines)
 
@@ -254,6 +263,19 @@ async def ai_status():
     return status
 
 
+@app.get("/time")
+async def get_time(current_user: User = Depends(get_current_active_user)):
+    """Get current time context for the authenticated user.
+    
+    Returns authoritative time information including current date, time, 
+    weekday, and timezone-aware timestamps. This ensures the LLM receives
+    accurate time context instead of calculating dates itself.
+    """
+    user_timezone = getattr(current_user, 'timezone', None) or "Africa/Nairobi"
+    time_context = TimeService.get_time_context(user_timezone)
+    return time_context
+
+
 # --- Authentication Endpoints ---
 
 
@@ -377,7 +399,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
         .all()
     )
 
-    openai_messages = [{"role": "system", "content": build_system_prompt(current_user, db, query_text=req.message)}]
+    openai_messages = [{"role": "system", "content": build_system_prompt(current_user, db, query_text=req.message, conversation_id=conv.id)}]
     openai_messages += [{"role": m.role, "content": m.content} for m in history]
     openai_messages.append({"role": "user", "content": req.message})
 
@@ -589,6 +611,90 @@ def list_memories_endpoint(
         return JSONResponse(status_code=500, content={"success": False, "message": "Internal server error."})
 
 
+# Phase 3 enhanced memory endpoints (must be defined before parameterized routes)
+@app.get("/memories/enhanced")
+def list_enhanced_memories_endpoint(
+    category: Optional[str] = Query(None),
+    project_id: Optional[int] = Query(None),
+    status: str = Query(MemoryStatus.ACTIVE),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """List enhanced memories with filters."""
+    try:
+        memories = MemoryService.get_user_memories(
+            db=db,
+            user_id=current_user.id,
+            category=category,
+            project_id=project_id,
+            status=status,
+            limit=limit
+        )
+        
+        return {
+            "items": [
+                {
+                    "id": m.id,
+                    "type": m.type,
+                    "category": m.category,
+                    "content": m.content,
+                    "source": m.source,
+                    "importance": m.importance,
+                    "confidence": m.confidence,
+                    "status": m.status,
+                    "project_id": m.project_id,
+                    "key": m.key,
+                    "tags": m.tags,
+                    "created_at": m.created_at.isoformat(),
+                    "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+                    "last_accessed_at": m.last_accessed_at.isoformat() if m.last_accessed_at else None,
+                    "last_confirmed_at": m.last_confirmed_at.isoformat() if m.last_confirmed_at else None
+                }
+                for m in memories
+            ],
+            "count": len(memories)
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.get("/memories/relevant")
+def get_relevant_memories_endpoint(
+    query: str = Query(..., description="Query text to find relevant memories"),
+    project_id: Optional[int] = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Get relevant memories using intelligent ranking."""
+    try:
+        memories = MemoryService.retrieve_relevant_memories(
+            db=db,
+            user_id=current_user.id,
+            query_text=query,
+            project_id=project_id,
+            limit=limit
+        )
+        return {"items": memories, "count": len(memories)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.post("/memories/detect-command")
+def detect_memory_command_endpoint(payload: dict, current_user: User = Depends(get_current_active_user)):
+    """Detect if a message contains a memory command."""
+    try:
+        message = payload.get("message", "")
+        if not message:
+            raise HTTPException(status_code=400, detail="message is required")
+        
+        result = MemoryService.detect_memory_command(message)
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
 @app.get("/memories/{memory_id}")
 def get_memory_endpoint(memory_id: int, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     try:
@@ -702,3 +808,247 @@ def batch_embeddings_endpoint(limit: int = Query(100, ge=1, le=1000), background
             return {"success": True, "processed": count}
     except Exception:
         return JSONResponse(status_code=500, content={"success": False, "message": "Failed to start batch job."})
+
+
+# --- Phase 3 Enhanced Memory Endpoints ---
+
+
+class EnhancedMemoryCreate(BaseModel):
+    content: str
+    type: str = "fact"
+    category: str = MemoryCategory.EXPLICIT
+    source: str = MemorySource.USER_EXPLICIT
+    importance: str = MemoryImportance.NORMAL
+    confidence: float = 0.8
+    project_id: Optional[int] = None
+    key: Optional[str] = None
+    tags: Optional[str] = None
+    extra_metadata: Optional[dict] = None
+
+
+class EnhancedMemoryUpdate(BaseModel):
+    content: Optional[str] = None
+    category: Optional[str] = None
+    importance: Optional[str] = None
+    confidence: Optional[float] = None
+    status: Optional[str] = None
+    project_id: Optional[int] = None
+    tags: Optional[str] = None
+    extra_metadata: Optional[dict] = None
+
+
+@app.post("/memories/enhanced")
+def create_enhanced_memory_endpoint(payload: EnhancedMemoryCreate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Create an enhanced memory with Phase 3 metadata."""
+    try:
+        # Check for duplicates
+        existing = MemoryService.deduplicate_memory(
+            db, current_user.id, payload.content, payload.category
+        )
+        if existing:
+            return {
+                "success": True,
+                "memory": {
+                    "id": existing.id,
+                    "content": existing.content,
+                    "category": existing.category,
+                    "message": "Memory reinforced (duplicate detected)"
+                }
+            }
+        
+        memory = MemoryService.create_memory(
+            db=db,
+            user_id=current_user.id,
+            content=payload.content,
+            memory_type=payload.type,
+            category=payload.category,
+            source=payload.source,
+            importance=payload.importance,
+            confidence=payload.confidence,
+            project_id=payload.project_id,
+            key=payload.key,
+            tags=payload.tags,
+            extra_metadata=payload.extra_metadata
+        )
+        
+        return {
+            "success": True,
+            "memory": {
+                "id": memory.id,
+                "content": memory.content,
+                "category": memory.category,
+                "importance": memory.importance,
+                "confidence": memory.confidence,
+                "source": memory.source,
+                "created_at": memory.created_at.isoformat()
+            }
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.put("/memories/enhanced/{memory_id}")
+def update_enhanced_memory_endpoint(memory_id: int, payload: EnhancedMemoryUpdate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Update an enhanced memory."""
+    try:
+        updates = {k: v for k, v in payload.dict().items() if v is not None}
+        if "extra_metadata" in updates and updates["extra_metadata"]:
+            updates["extra_metadata"] = json.dumps(updates["extra_metadata"])
+        
+        memory = MemoryService.update_memory(db, memory_id, current_user.id, **updates)
+        if not memory:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Memory not found."})
+        
+        return {
+            "success": True,
+            "memory": {
+                "id": memory.id,
+                "updated_at": memory.updated_at.isoformat() if memory.updated_at else None
+            }
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+# --- Project Endpoints ---
+
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+@app.post("/projects")
+def create_project_endpoint(payload: ProjectCreate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Create a new project."""
+    try:
+        project = MemoryService.create_project(
+            db=db,
+            user_id=current_user.id,
+            name=payload.name,
+            description=payload.description
+        )
+        return {
+            "success": True,
+            "project": {
+                "id": project.id,
+                "name": project.name,
+                "description": project.description,
+                "created_at": project.created_at.isoformat()
+            }
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.get("/projects")
+def list_projects_endpoint(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """List all projects for the current user."""
+    try:
+        projects = MemoryService.get_user_projects(db, current_user.id)
+        return {
+            "items": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "created_at": p.created_at.isoformat(),
+                    "updated_at": p.updated_at.isoformat() if p.updated_at else None
+                }
+                for p in projects
+            ],
+            "count": len(projects)
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.get("/projects/{project_id}")
+def get_project_endpoint(project_id: int, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Get a specific project with its memories."""
+    try:
+        project = db.query(Project).filter(
+            Project.id == project_id,
+            Project.user_id == current_user.id
+        ).first()
+        if not project:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Project not found."})
+        
+        memories = MemoryService.get_user_memories(
+            db, current_user.id, project_id=project_id, limit=50
+        )
+        
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "created_at": project.created_at.isoformat(),
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None,
+            "memories": [
+                {
+                    "id": m.id,
+                    "content": m.content,
+                    "category": m.category,
+                    "importance": m.importance
+                }
+                for m in memories
+            ],
+            "memory_count": len(memories)
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.put("/projects/{project_id}")
+def update_project_endpoint(project_id: int, payload: ProjectUpdate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Update a project."""
+    try:
+        project = db.query(Project).filter(
+            Project.id == project_id,
+            Project.user_id == current_user.id
+        ).first()
+        if not project:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Project not found."})
+        
+        if payload.name:
+            project.name = payload.name
+        if payload.description is not None:
+            project.description = payload.description
+        project.updated_at = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(project)
+        
+        return {
+            "success": True,
+            "project": {
+                "id": project.id,
+                "updated_at": project.updated_at.isoformat()
+            }
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+
+@app.delete("/projects/{project_id}")
+def delete_project_endpoint(project_id: int, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    """Delete a project."""
+    try:
+        project = db.query(Project).filter(
+            Project.id == project_id,
+            Project.user_id == current_user.id
+        ).first()
+        if not project:
+            return JSONResponse(status_code=404, content={"success": False, "message": "Project not found."})
+        
+        db.delete(project)
+        db.commit()
+        
+        return {"success": True, "message": "Project deleted successfully."}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})

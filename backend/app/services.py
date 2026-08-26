@@ -90,7 +90,7 @@ def list_conversations(
         q = q.filter(Conversation.created_at <= date_to)
 
     # total distinct conversations matching filters
-    total_q = q.statement.with_only_columns([func.count(func.distinct(Conversation.id))]).order_by(None)
+    total_q = q.statement.with_only_columns(func.count(func.distinct(Conversation.id))).order_by(None)
     total = db.execute(total_q).scalar() or 0
 
     total_pages = (total + page_size - 1) // page_size if total else 0
@@ -249,7 +249,7 @@ def list_memories(
     if date_to:
         q = q.filter(Memory.created_at <= date_to)
 
-    total_q = q.statement.with_only_columns([func.count(Memory.id)]).order_by(None)
+    total_q = q.statement.with_only_columns(func.count(Memory.id)).order_by(None)
     total = db.execute(total_q).scalar() or 0
     total_pages = (total + page_size - 1) // page_size if total else 0
 
