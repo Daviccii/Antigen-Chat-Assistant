@@ -4,13 +4,9 @@ from sqlalchemy.orm import relationship
 from .db import Base
 import enum
 
-# pgvector support - graceful fallback if extension not available
-try:
-    from pgvector.sqlalchemy import Vector
-    PGVECTOR_AVAILABLE = True
-except ImportError:
-    PGVECTOR_AVAILABLE = False
-    Vector = None
+# pgvector support - now that extension is properly installed
+from pgvector.sqlalchemy import Vector
+PGVECTOR_AVAILABLE = True
 
 
 class UserRole(str, enum.Enum):
@@ -89,13 +85,9 @@ class Memory(Base):
     last_accessed_at = Column(DateTime, nullable=True)
     last_confirmed_at = Column(DateTime, nullable=True)
     
-    # Embedding for semantic search - supports both pgvector and fallback
-    if PGVECTOR_AVAILABLE:
-        # 768 dims matches nomic-embed-text (the local Ollama embedding model)
-        embedding = Column(Vector(768), nullable=True)
-    else:
-        # Fallback to TEXT when pgvector is not available
-        embedding = Column(Text, nullable=True)
+    # Embedding for semantic search - pgvector is now properly installed
+    # 768 dims matches nomic-embed-text (the local Ollama embedding model)
+    embedding = Column(Vector(768), nullable=True)
     
     # Additional metadata as JSON
     extra_metadata = Column(Text, nullable=True)  # JSON string for flexible additional data
