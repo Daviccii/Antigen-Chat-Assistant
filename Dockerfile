@@ -34,4 +34,4 @@ RUN cp -r frontend/dist/* /app/backend/static/
 EXPOSE 8000
 
 # Run database migrations and start the application
-CMD cd backend && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000
+CMD ["sh", "-c", "cd backend && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
