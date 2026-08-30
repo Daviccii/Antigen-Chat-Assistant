@@ -1,4 +1,6 @@
-export const API_BASE = 'http://localhost:8000'
+// Use environment variable for API base URL, fallback to localhost for development
+// In production when served from same origin, use empty string for relative URLs
+export const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 
 // In-memory token, mirrored to localStorage by AuthContext. Kept here (not
 // re-read from localStorage on every call) so a logout takes effect

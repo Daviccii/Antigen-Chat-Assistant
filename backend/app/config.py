@@ -11,9 +11,10 @@ class Settings(BaseSettings):
     BACKEND_PORT: int = 8000
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2"
-    SECRET_KEY: str = "your-secret-key-change-this-in-production"
+    SECRET_KEY: str = "change-this-in-production-use-environment-variable"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
+    FRONTEND_URL: str = "http://localhost:5173"
 
     # env_file_encoding='utf-8-sig' strips a leading BOM if one is present
     # (common when a .env is created via PowerShell's Out-File -Encoding utf8),

@@ -1,12 +1,14 @@
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import httpx
 import json
 import asyncio
+from pathlib import Path
 
 from .config import settings
 from .db import SessionLocal, init_db
@@ -28,22 +30,40 @@ from .services import (
 )
 from .auth import get_current_active_user, require_owner, create_access_token
 from .auth_service import AuthService
-from .voice import router as voice_router
+# Voice router disabled for production - requires significant CPU resources
+# from .voice import router as voice_router
 from .time_service import TimeService
 
 app = FastAPI(title="Antigen API")
 
-# Allow any localhost dev port (Vite shifts ports — 5173, 5174, 5175...
-# when a previous instance is still holding one) instead of hardcoding one.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configure CORS based on environment
+# In development, allow localhost; in production, use the configured FRONTEND_URL
+if "localhost" in settings.FRONTEND_URL or "127.0.0.1" in settings.FRONTEND_URL:
+    # Development: allow any localhost port (Vite shifts ports)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Production: allow only the configured frontend URL
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.FRONTEND_URL],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-app.include_router(voice_router)
+# Voice router disabled for production
+# app.include_router(voice_router)
+
+# Serve static files for frontend (if built)
+static_dir = Path(__file__).parent.parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 def build_system_prompt(user: User, db: Session, query_text: str | None = None, conversation_id: int | None = None) -> str:
     """Personalized system prompt for the current user, refreshed on every
