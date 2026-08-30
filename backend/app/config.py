@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
@@ -5,7 +6,7 @@ ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 
 class Settings(BaseSettings):
-    OPENAI_API_KEY: str | None = None
+    OPENAI_API_KEY: Optional[str] = None
     DATABASE_URL: str = "postgresql+psycopg2://antigen:antigen@localhost:5432/antigen"
     BACKEND_HOST: str = "0.0.0.0"
     BACKEND_PORT: int = 8000
@@ -30,3 +31,4 @@ if __name__ == "__main__":
     print(f"Looking for .env at: {ENV_PATH}")
     print(f".env exists: {ENV_PATH.exists()}")
     print(f"OPENAI_API_KEY loaded: {bool(settings.OPENAI_API_KEY)}")
+
