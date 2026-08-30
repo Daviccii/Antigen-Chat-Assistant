@@ -5,9 +5,9 @@ cmds = [
 ]
 
 [phases.start]
-cmd = "cd backend && ./start.sh"
+cmd = "cd backend && chmod +x start.sh && ./start.sh"
 
 [variables]
 PORT = "8000"
-PYTHON_VERSION = "3.11"
-NODE_VERSION = "18"
+NIXPACKS_PYTHON_VERSION = "3.11"
+NIXPACKS_NODE_VERSION = "18"
