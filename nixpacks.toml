@@ -4,7 +4,7 @@ cmds = [
     "cd backend && pip install -r requirements.txt"
 ]
 
-[phases.start]
+[start]
 cmd = "cd backend && chmod +x start.sh && ./start.sh"
 
 [variables]
