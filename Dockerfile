@@ -1,34 +1,33 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     postgresql-client \
-    nodejs \
-    npm \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies
+# Python dependencies
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Install frontend dependencies
+# Frontend dependencies
 COPY frontend/package.json frontend/package-lock.json* /app/frontend/
-RUN cd /app/frontend && npm install
+RUN apt-get update && apt-get install -y nodejs npm && \
+    cd /app/frontend && npm install && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy application
-COPY . .
+# Application code
+COPY . /app
 
 # Build frontend
 RUN cd /app/frontend && npm run build
-
-# Copy frontend into backend static directory
 RUN mkdir -p /app/backend/static && \
     cp -r /app/frontend/dist/* /app/backend/static/
 
 EXPOSE 8000
 
-# Run migrations and start application
-CMD ["sh", "-c", "cd /app/backend && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "cd /app/backend && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
