@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     BACKEND_PORT: int = 8000
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2"
+    OLLAMA_NUM_CTX: int = 2048  # Context window size
+    OLLAMA_NUM_GPU: int = 0  # Number of GPU layers (0 = CPU only, safer default)
+    OLLAMA_TEMPERATURE: float = 0.7  # Generation temperature
+    OLLAMA_TOP_P: float = 0.9  # Top-p sampling
     SECRET_KEY: str = "change-this-in-production-use-environment-variable"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week

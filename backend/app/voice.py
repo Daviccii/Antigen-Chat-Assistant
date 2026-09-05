@@ -26,6 +26,7 @@ Wire this into your app in main.py:
     app.include_router(voice_router)
 """
 import io
+import os
 import tempfile
 import wave
 from pathlib import Path
@@ -92,8 +93,10 @@ async def transcribe(
 # Map of friendly voice name -> path to its .onnx model file. Add more
 # entries here as you download additional voices with
 # `python -m piper.download_voices <voice-name>`.
+# Voice models should be placed in the backend directory
+backend_dir = Path(__file__).parent.parent
 VOICE_MODELS = {
-    "lessac": "en_US-lessac-medium.onnx",
+    "lessac": str(backend_dir / "en_US-lessac-medium.onnx"),
 }
 DEFAULT_VOICE = "lessac"
 
@@ -106,7 +109,13 @@ def get_piper_voice(voice_name: str | None = None):
     if name not in _piper_voices:
         from piper import PiperVoice
 
-        _piper_voices[name] = PiperVoice.load(VOICE_MODELS[name])
+        voice_path = VOICE_MODELS[name]
+        if not os.path.exists(voice_path):
+            raise FileNotFoundError(
+                f"Voice model file not found: {voice_path}. "
+                f"Download it with: python -m piper.download_voices en_US-lessac-medium"
+            )
+        _piper_voices[name] = PiperVoice.load(voice_path)
     return _piper_voices[name]
 
 

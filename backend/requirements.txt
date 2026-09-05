@@ -11,3 +11,6 @@ python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.6
 pytz>=2023.3
 alembic>=1.12.0
+faster-whisper>=1.0.0
+piper-tts>=1.2.0
+langgraph>=0.0.20

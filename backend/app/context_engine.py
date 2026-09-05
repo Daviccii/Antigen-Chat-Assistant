@@ -14,6 +14,8 @@ rather than inventing information.
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from datetime import datetime
+import time
+import logging
 
 from .models import User, Memory, Project
 from .time_service import TimeService
@@ -23,6 +25,8 @@ from .memory_service import (
     MemoryImportance,
     MemorySource
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ContextEngine:
@@ -37,25 +41,39 @@ class ContextEngine:
         project_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """Build complete context for LLM request."""
+        start_time = time.time()
         
         # 1. Time Context (Authoritative)
+        time_start = time.time()
         time_context = TimeService.get_time_context(user.timezone or "Africa/Nairobi")
+        logger.debug(f"Time context built in {time.time() - time_start:.3f}s")
         
         # 2. User Profile Context
+        user_start = time.time()
         user_profile = ContextEngine._build_user_profile(user)
+        logger.debug(f"User profile built in {time.time() - user_start:.3f}s")
         
         # 3. Memory Context
+        memory_start = time.time()
         memory_context = ContextEngine._build_memory_context(
             db, user.id, query_text, project_id
         )
+        logger.debug(f"Memory context built in {time.time() - memory_start:.3f}s")
         
         # 4. Project Context
+        project_start = time.time()
         project_context = ContextEngine._build_project_context(db, user.id, project_id)
+        logger.debug(f"Project context built in {time.time() - project_start:.3f}s")
         
         # 5. Conversation Context
+        conv_start = time.time()
         conversation_context = ContextEngine._build_conversation_context(
             db, user.id, conversation_id
         )
+        logger.debug(f"Conversation context built in {time.time() - conv_start:.3f}s")
+        
+        total_time = time.time() - start_time
+        logger.info(f"Total context building time: {total_time:.3f}s")
         
         return {
             "time": time_context,
@@ -87,37 +105,48 @@ class ContextEngine:
     ) -> Dict[str, Any]:
         """Build memory context with intelligent retrieval."""
         
-        # Get user profile memories
-        profile_memories = MemoryService.get_user_memories(
-            db, user_id, category=MemoryCategory.USER_PROFILE, limit=5
-        )
+        # Only retrieve memories when we have a query to match against
+        # This avoids unnecessary database queries for simple greetings
+        if not query_text or len(query_text.strip()) < 10:
+            # For short messages, only get critical user profile info
+            profile_memories = MemoryService.get_user_memories(
+                db, user_id, category=MemoryCategory.USER_PROFILE, limit=3
+            )
+            
+            return {
+                "profile_memories": [
+                    {
+                        "content": m.content,
+                        "confidence": m.confidence,
+                        "last_confirmed": m.last_confirmed_at.isoformat() if m.last_confirmed_at else None
+                    }
+                    for m in profile_memories
+                ],
+                "explicit_memories": [],
+                "preferences": [],
+                "relevant_memories": []
+            }
         
-        # Get explicit memories
-        explicit_memories = MemoryService.get_user_memories(
-            db, user_id, category=MemoryCategory.EXPLICIT, limit=10
-        )
-        
-        # Get preference memories
-        preference_memories = MemoryService.get_user_memories(
-            db, user_id, category=MemoryCategory.PREFERENCE, limit=5
-        )
-        
-        # Get relevant memories based on query
+        # For substantive queries, retrieve relevant memories more efficiently
+        # Combine retrieval into fewer queries
         relevant_memories = []
         if query_text:
             relevant_memories = MemoryService.retrieve_relevant_memories(
-                db, user_id, query_text, project_id=project_id, limit=8
+                db, user_id, query_text, project_id=project_id, limit=5  # Reduced from 8
             )
         
+        # Only get explicit memories if they're highly important
+        explicit_memories = MemoryService.get_user_memories(
+            db, user_id, category=MemoryCategory.EXPLICIT, limit=5  # Reduced from 10
+        )
+        
+        # Preferences are important but keep limit reasonable
+        preference_memories = MemoryService.get_user_memories(
+            db, user_id, category=MemoryCategory.PREFERENCE, limit=3  # Reduced from 5
+        )
+        
         return {
-            "profile_memories": [
-                {
-                    "content": m.content,
-                    "confidence": m.confidence,
-                    "last_confirmed": m.last_confirmed_at.isoformat() if m.last_confirmed_at else None
-                }
-                for m in profile_memories
-            ],
+            "profile_memories": [],  # Skip profile for complex queries, focus on relevant
             "explicit_memories": [
                 {
                     "content": m.content,
@@ -142,42 +171,44 @@ class ContextEngine:
         user_id: int,
         project_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Build project context."""
-        projects = MemoryService.get_user_projects(db, user_id)
+        """Build project context - optimized to only load when necessary."""
         
-        project_details = []
-        for project in projects:
-            project_memories = MemoryService.get_user_memories(
-                db, user_id, project_id=project.id, limit=10
-            )
-            
-            project_details.append({
-                "id": project.id,
-                "name": project.name,
-                "description": project.description,
-                "memory_count": len(project_memories),
-                "key_memories": [
-                    {
-                        "content": m.content,
-                        "importance": m.importance
-                    }
-                    for m in project_memories[:5]  # Top 5 memories per project
-                ]
-            })
+        # Only load project context if a specific project is requested
+        # This avoids loading all projects on every request
+        if not project_id:
+            return {"all_projects": []}
         
-        # If specific project requested, prioritize it
-        if project_id:
-            specific_project = next(
-                (p for p in project_details if p["id"] == project_id),
-                None
-            )
-            if specific_project:
-                return {
-                    "current_project": specific_project,
-                    "all_projects": project_details
+        # Load only the specific project requested by ID
+        from .models import Project
+        project = db.query(Project).filter(
+            Project.id == project_id,
+            Project.user_id == user_id
+        ).first()
+        
+        if not project:
+            return {"all_projects": []}
+        
+        # Only load memories for this specific project, with limited count
+        project_memories = MemoryService.get_user_memories(
+            db, user_id, project_id=project.id, limit=5  # Reduced from 10
+        )
+        
+        project_details = [{
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "memory_count": len(project_memories),
+            "key_memories": [
+                {
+                    "content": m.content,
+                    "importance": m.importance
                 }
+                for m in project_memories[:3]  # Reduced from 5
+            ]
+        }]
         
         return {
+            "current_project": project_details[0],
             "all_projects": project_details
         }
     
@@ -187,7 +218,7 @@ class ContextEngine:
         user_id: int,
         conversation_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Build conversation context."""
+        """Build conversation context - optimized to limit history loading."""
         from .models import Conversation, Message as MessageModel
         
         if not conversation_id:
@@ -201,34 +232,34 @@ class ContextEngine:
         if not conversation:
             return {"has_active_conversation": False}
         
+        # Only load recent messages instead of entire history
+        # This is the key optimization - limit to last 6 messages (3 exchanges)
         messages = (
             db.query(MessageModel)
             .filter(MessageModel.conversation_id == conversation.id)
-            .order_by(MessageModel.created_at.asc())
+            .order_by(MessageModel.created_at.desc())
+            .limit(6)
             .all()
         )
         
-        # Get recent messages (last 10)
+        # Reverse to get chronological order
+        messages = list(reversed(messages))
+        
         recent_messages = [
             {
                 "role": m.role,
                 "content": m.content,
                 "timestamp": m.created_at.isoformat()
             }
-            for m in messages[-10:]
+            for m in messages
         ]
-        
-        # Generate conversation summary for long conversations
-        summary = None
-        if len(messages) > 20:
-            summary = ContextEngine._generate_conversation_summary(messages)
         
         return {
             "has_active_conversation": True,
             "conversation_id": conversation.id,
             "message_count": len(messages),
             "recent_messages": recent_messages,
-            "summary": summary
+            "summary": None  # Removed summary generation for performance
         }
     
     @staticmethod

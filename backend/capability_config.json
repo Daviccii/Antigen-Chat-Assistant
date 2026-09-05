@@ -1,0 +1,116 @@
+{
+  "domains": {
+    "software_engineering": {
+      "name": "software_engineering",
+      "description": "Software development and engineering tasks",
+      "enabled": true,
+      "tools": [
+        "list_directory",
+        "read_file",
+        "analyze_project_structure"
+      ],
+      "skills": [
+        "analyze_project",
+        "explore_files"
+      ]
+    },
+    "system": {
+      "name": "system",
+      "description": "System diagnostics and information",
+      "enabled": true,
+      "tools": [
+        "get_system_info",
+        "get_disk_usage",
+        "get_current_time"
+      ],
+      "skills": [
+        "system_diagnostics"
+      ]
+    },
+    "it": {
+      "name": "it",
+      "description": "IT operations and maintenance",
+      "enabled": true,
+      "tools": [
+        "get_system_info",
+        "get_disk_usage",
+        "get_current_time"
+      ],
+      "skills": [
+        "get_system_information"
+      ]
+    }
+  },
+  "tools": {
+    "list_directory": {
+      "name": "list_directory",
+      "description": "List contents of a directory",
+      "input_schema": {
+        "path": {
+          "type": "string",
+          "description": "Directory path to list",
+          "required": false,
+          "default": "."
+        },
+        "max_items": {
+          "type": "integer",
+          "description": "Maximum number of items to return",
+          "required": false,
+          "default": 100
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "description": "Directory listing with file names and types"
+      },
+      "permission_level": "READ_ONLY",
+      "domain": "file_system",
+      "category": "exploration"
+    },
+    "read_file": {
+      "name": "read_file",
+      "description": "Read contents of a text file",
+      "input_schema": {
+        "path": {
+          "type": "string",
+          "description": "File path to read",
+          "required": true
+        },
+        "max_lines": {
+          "type": "integer",
+          "description": "Maximum number of lines to read",
+          "required": false,
+          "default": 100
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "description": "File contents as lines of text"
+      },
+      "permission_level": "READ_ONLY",
+      "domain": "file_system",
+      "category": "exploration"
+    }
+  },
+  "skills": {
+    "analyze_project": {
+      "name": "analyze_project",
+      "description": "Analyze a software project structure and detect its type, organization, and key components",
+      "domain": "software_engineering",
+      "required_tools": [
+        "analyze_project_structure",
+        "list_directory",
+        "read_file"
+      ],
+      "capabilities": [
+        "Detect project type (Python, Node.js, etc.)",
+        "Identify project structure and organization",
+        "List key project files and directories",
+        "Provide basic project insights"
+      ],
+      "instructions": "To analyze a project:\n1. Use analyze_project_structure to detect project type\n2. Use list_directory to explore the main directory structure\n3. Use read_file to examine key configuration files if needed\n4. Summarize findings about the project's type, structure, and organization",
+      "execution_strategy": "sequential",
+      "permission_level": "READ_ONLY"
+    }
+  }
+}

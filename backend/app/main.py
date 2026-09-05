@@ -8,7 +8,11 @@ from datetime import datetime
 import httpx
 import json
 import asyncio
+import uuid
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from .config import settings
 from .db import SessionLocal, init_db
@@ -30,11 +34,18 @@ from .services import (
 )
 from .auth import get_current_active_user, require_owner, create_access_token
 from .auth_service import AuthService
-# Voice router disabled for production - requires significant CPU resources
-# from .voice import router as voice_router
+from .voice import router as voice_router
 from .time_service import TimeService
+from .performance import PerformanceTracker, track_performance
+from .capability_routes import router as capability_router
 
 app = FastAPI(title="Antigen API")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Configure CORS based on environment
 # In development, allow localhost; in production, use the configured FRONTEND_URL
@@ -57,8 +68,11 @@ else:
         allow_headers=["*"],
     )
 
-# Voice router disabled for production
-# app.include_router(voice_router)
+# Include voice router
+app.include_router(voice_router)
+
+# Include capability router
+app.include_router(capability_router)
 
 # Serve static files for frontend (if built)
 static_dir = Path(__file__).parent.parent / "static"
@@ -81,8 +95,21 @@ def build_system_prompt(user: User, db: Session, query_text: str | None = None, 
     lines = [
         f"You are Antigen, {name}'s personal AI assistant.",
         f"{name} is your one and only primary user. You take direction only from them.",
-        f"Address {name} by name where it feels natural, and speak as their own "
-        f"private assistant rather than a generic chatbot.",
+        "",
+        "CONVERSATION STYLE:",
+        "- Be natural, conversational, and fluent",
+        "- Use contractions naturally (don't, can't, I'm, etc.)",
+        "- Give short, direct answers for simple questions",
+        "- Be detailed only when the user actually needs detail",
+        "- Don't over-explain or repeat the user's question",
+        "- Avoid robotic phrases like 'certainly', 'absolutely', 'of course'",
+        "- Don't use unnecessary headings or bullet points in casual conversation",
+        "- Respond appropriately to casual statements and acknowledgments",
+        "- Understand follow-up questions without making the user repeat context",
+        "- Handle pronouns and references like 'it', 'that', 'the other one' based on recent conversation",
+        "- Adapt your response length to the user's intent",
+        "- You can give brief acknowledgments like 'Got it', 'Nice', 'Exactly', etc.",
+        "- Stay honest that you're an AI, but sound natural and human-like in style",
     ]
 
     # Use Context Engine for comprehensive context
@@ -385,6 +412,11 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
     
     Conversations are now scoped to the authenticated user.
     """
+    # Initialize performance tracking
+    request_id = str(uuid.uuid4())[:8]
+    tracker = PerformanceTracker(request_id)
+    tracker.mark("request_received")
+    
     api_key = settings.OPENAI_API_KEY
     use_ollama = req.model.startswith("ollama:")
 
@@ -393,6 +425,8 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
 
     if not req.message or not req.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
+
+    tracker.mark("validation_complete")
 
     conv = None
     is_new = req.conversation_id is None
@@ -410,30 +444,59 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
         db.commit()
         db.refresh(conv)
 
+    tracker.mark("conversation_loaded")
+
     # Load prior history so the model has context, without the frontend
     # needing to resend it (and without us re-storing duplicates).
+    # OPTIMIZATION: Only load recent messages instead of entire history
     history = (
         db.query(MessageModel)
         .filter(MessageModel.conversation_id == conv.id)
-        .order_by(MessageModel.created_at.asc())
+        .order_by(MessageModel.created_at.desc())
+        .limit(6)
         .all()
     )
+    
+    # Reverse to get chronological order
+    history = list(reversed(history))
+
+    tracker.mark("history_loaded")
 
     openai_messages = [{"role": "system", "content": build_system_prompt(current_user, db, query_text=req.message, conversation_id=conv.id)}]
     openai_messages += [{"role": m.role, "content": m.content} for m in history]
     openai_messages.append({"role": "user", "content": req.message})
 
+    tracker.mark("context_built")
+
     # Persist only the new user message now.
     db.add(MessageModel(conversation_id=conv.id, role="user", content=req.message))
     db.commit()
 
+    tracker.mark("user_message_saved")
+    
+    # Log context building timing
+    context_time = tracker.calculate_delta("history_loaded", "context_built")
+    if context_time:
+        logger.info(f"Context building took {context_time:.3f}s")
+
     async def stream_response():
         assistant_text_parts = []
+        first_token_received = False
 
         if use_ollama:
             ollama_model = req.model.split("ollama:", 1)[1]
             url = f"{settings.OLLAMA_BASE_URL}/api/chat"
-            payload = {"model": ollama_model, "messages": openai_messages, "stream": True}
+            payload = {
+                "model": ollama_model, 
+                "messages": openai_messages, 
+                "stream": True,
+                "options": {
+                    "num_ctx": settings.OLLAMA_NUM_CTX,
+                    "num_gpu": settings.OLLAMA_NUM_GPU,
+                    "temperature": settings.OLLAMA_TEMPERATURE,
+                    "top_p": settings.OLLAMA_TOP_P
+                }
+            }
 
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
@@ -450,6 +513,9 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
                             chunk = json.loads(line)
                             delta = chunk.get("message", {}).get("content", "")
                             if delta:
+                                if not first_token_received:
+                                    first_token_received = True
+                                    tracker.mark("llm_first_token")
                                 assistant_text_parts.append(delta)
                                 yield json.dumps({"delta": delta}) + "\n"
                             if chunk.get("done"):
@@ -483,6 +549,8 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
             assistant_text_parts.append(text)
             yield json.dumps({"delta": text}) + "\n"
 
+        tracker.mark("llm_complete")
+
         full_text = "".join(assistant_text_parts)
         if full_text:
             # Use a fresh session here rather than the request-scoped `db` —
@@ -493,6 +561,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
             try:
                 save_db.add(MessageModel(conversation_id=conv.id, role="assistant", content=full_text))
                 save_db.commit()
+                tracker.mark("assistant_message_saved")
 
                 await extract_and_save_memories(
                     db=save_db,
@@ -500,9 +569,13 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
                     user_message=req.message,
                     assistant_reply=full_text,
                 )
+                tracker.mark("memory_extraction_complete")
             finally:
                 save_db.close()
 
+        tracker.mark("request_complete")
+        tracker.log_summary()
+        
         yield json.dumps({"done": True, "conversation_id": conv.id}) + "\n"
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
