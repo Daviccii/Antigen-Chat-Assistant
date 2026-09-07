@@ -4,7 +4,8 @@ This module provides the main LangGraph workflow orchestration for Antigen.
 It serves as an orchestration layer over the existing capability system.
 
 Phase B1: Minimal graph with initialize_task node only.
-The graph will be extended in later phases with planning, execution, and recovery nodes.
+Phase B2: Extended graph with LLM-powered planning nodes (understand, domain, skill, plan).
+The graph will be extended in later phases with execution, verification, and recovery nodes.
 """
 from typing import Dict, Any, Optional
 import logging
@@ -15,7 +16,13 @@ from .langgraph_state import (
     TaskStatus, 
     create_initial_state
 )
-from .langgraph_nodes import initialize_task
+from .langgraph_nodes import (
+    initialize_task,
+    understand_task,
+    identify_domain,
+    select_skill,
+    create_execution_plan
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +33,21 @@ class LangGraphOrchestrator:
     This class provides a clean interface for running tasks through LangGraph
     while integrating with the existing capability system.
     
-    Phase B1: Basic graph structure with initialization only.
+    Phase B2: Extended graph with LLM-powered planning nodes.
     """
     
     def __init__(self):
-        """Initialize the LangGraph orchestrator with the basic workflow."""
+        """Initialize the LangGraph orchestrator with the B2 planning workflow."""
         self.graph = self._build_graph()
-        logger.info("LangGraph orchestrator initialized with basic B1 workflow")
+        logger.info("LangGraph orchestrator initialized with B2 planning workflow")
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow.
         
-        Phase B1: Simple workflow with only initialization.
-        Later phases will add planning, execution, verification, and recovery.
+        Phase B2: Extended workflow with LLM-powered planning.
+        Workflow: START -> initialize_task -> understand_task -> identify_domain 
+                 -> select_skill -> create_execution_plan -> END
+        Later phases will add execution, verification, and recovery.
         
         Returns:
             Compiled LangGraph StateGraph
@@ -46,17 +55,27 @@ class LangGraphOrchestrator:
         # Create the graph with our state type
         workflow = StateGraph(AntigenTaskState)
         
-        # Add the initialization node (Phase B1 only)
+        # Add Phase B1 node
         workflow.add_node("initialize_task", initialize_task)
         
-        # Define the basic workflow: START -> initialize_task -> END
+        # Add Phase B2 planning nodes
+        workflow.add_node("understand_task", understand_task)
+        workflow.add_node("identify_domain", identify_domain)
+        workflow.add_node("select_skill", select_skill)
+        workflow.add_node("create_execution_plan", create_execution_plan)
+        
+        # Define the Phase B2 workflow
         workflow.set_entry_point("initialize_task")
-        workflow.add_edge("initialize_task", END)
+        workflow.add_edge("initialize_task", "understand_task")
+        workflow.add_edge("understand_task", "identify_domain")
+        workflow.add_edge("identify_domain", "select_skill")
+        workflow.add_edge("select_skill", "create_execution_plan")
+        workflow.add_edge("create_execution_plan", END)
         
         # Compile the graph
         return workflow.compile()
     
-    def run_task(
+    async def run_task(
         self,
         user_request: str,
         user_id: int,
@@ -65,8 +84,8 @@ class LangGraphOrchestrator:
     ) -> Dict[str, Any]:
         """Run a task through the LangGraph orchestration.
         
-        Phase B1: Basic execution that initializes and validates the task.
-        Later phases will perform full planning, execution, and verification.
+        Phase B2: Execution with LLM-powered planning (understand, domain, skill, plan).
+        Later phases will add execution, verification, and recovery.
         
         Args:
             user_request: The user's natural language request
@@ -88,8 +107,8 @@ class LangGraphOrchestrator:
         )
         
         try:
-            # Run the graph
-            final_state = self.graph.invoke(initial_state)
+            # Run the graph (now async due to LLM calls)
+            final_state = await self.graph.ainvoke(initial_state)
             
             # Prepare result
             result = {
@@ -100,6 +119,7 @@ class LangGraphOrchestrator:
                 "conversation_id": final_state["conversation_id"],
                 "selected_domain": final_state["selected_domain"],
                 "selected_skill": final_state["selected_skill"],
+                "plan": final_state["plan"],
                 "execution_results": final_state["execution_results"],
                 "errors": final_state["errors"],
                 "final_result": final_state["final_result"],
@@ -119,6 +139,9 @@ class LangGraphOrchestrator:
                 "status": TaskStatus.FAILED.value,
                 "user_request": user_request,
                 "user_id": user_id,
+                "selected_domain": None,
+                "selected_skill": None,
+                "plan": None,
                 "errors": [f"LangGraph execution error: {str(e)}"],
                 "execution_results": [],
                 "final_result": None,
@@ -134,13 +157,18 @@ class LangGraphOrchestrator:
             Dictionary with graph metadata
         """
         return {
-            "phase": "B1",
-            "description": "Basic LangGraph foundation with initialization only",
-            "nodes": ["initialize_task"],
-            "workflow": "START -> initialize_task -> END",
+            "phase": "B2",
+            "description": "LangGraph with LLM-powered intelligent planning",
+            "nodes": [
+                "initialize_task",
+                "understand_task",
+                "identify_domain",
+                "select_skill",
+                "create_execution_plan"
+            ],
+            "workflow": "START -> initialize_task -> understand_task -> identify_domain -> select_skill -> create_execution_plan -> END",
             "future_phases": [
-                "B2: LLM-powered planning and skill selection",
-                "B3: Intelligent tool selection",
+                "B3: Intelligent tool selection and permission validation",
                 "B4: Sequential execution with existing capability system",
                 "B5: Error recovery and verification",
                 "B6: Memory integration and learning"

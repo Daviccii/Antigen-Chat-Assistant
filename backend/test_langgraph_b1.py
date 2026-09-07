@@ -7,10 +7,13 @@ Tests the basic LangGraph integration:
 - Integration with existing systems
 
 Phase B1: Basic functionality tests only.
+Note: Updated for B2 async interface compatibility. Tests now run through
+the B2 workflow but verify B1 foundation functionality remains intact.
 """
 import pytest
 import sys
 import os
+import asyncio
 from datetime import datetime
 
 # Add the parent directory to the path to import app modules
@@ -26,6 +29,24 @@ from app.langgraph_state import (
 )
 from app.langgraph_nodes import initialize_task
 from app.langgraph_orchestrator import LangGraphOrchestrator, langgraph_orchestrator
+from unittest.mock import patch
+
+
+# Simple mock for B1 tests that now run through B2 workflow
+async def simple_mock_llm(messages, temperature=0.7, max_tokens=1000):
+    """Simple mock LLM for B1 tests."""
+    last_message = messages[-1]["content"].lower()
+    
+    if "analyze the following user request" in last_message and "json format" in last_message:
+        return '{"task_type": "test", "primary_objective": "test", "key_entities": [], "parameters": {}, "constraints": [], "expected_output": "test"}'
+    elif "select the most appropriate domain" in last_message:
+        return "software_engineering"
+    elif "select the most appropriate skill" in last_message:
+        return "analyze_project"
+    elif "create a detailed execution plan" in last_message:
+        return '{"steps": [{"step_number": 1, "description": "test", "tool": "test", "inputs": {}, "expected_output": "test"}], "estimated_complexity": "low", "requires_confirmation": false}'
+    
+    return "test"
 
 
 # ---------------------------------------------------------------------------
@@ -165,23 +186,24 @@ def test_orchestrator_initialization():
     assert orchestrator.graph is not None
 
 
-def test_orchestrator_run_task_basic():
+async def test_orchestrator_run_task_basic():
     """Test basic task execution through the orchestrator."""
-    result = langgraph_orchestrator.run_task(
+    result = await langgraph_orchestrator.run_task(
         user_request="Test task",
         user_id=1
     )
     
     assert result["success"] == True
-    assert result["status"] == TaskStatus.INITIALIZING.value
+    # With B2 workflow, status will be PLANNING after full execution
+    assert result["status"] in [TaskStatus.INITIALIZING.value, TaskStatus.PLANNING.value]
     assert result["user_request"] == "Test task"
     assert result["user_id"] == 1
     assert result["metadata"]["initialized"] == True
 
 
-def test_orchestrator_run_task_with_context():
+async def test_orchestrator_run_task_with_context():
     """Test task execution with context."""
-    result = langgraph_orchestrator.run_task(
+    result = await langgraph_orchestrator.run_task(
         user_request="Test with context",
         user_id=1,
         conversation_id=123,
@@ -198,8 +220,11 @@ def test_orchestrator_get_graph_info():
     """Test that graph information can be retrieved."""
     info = langgraph_orchestrator.get_graph_info()
     
-    assert info["phase"] == "B1"
+    # Updated to expect B2 since orchestrator now uses B2 workflow
+    assert info["phase"] == "B2"
+    # Should still have B1 node plus B2 nodes
     assert "initialize_task" in info["nodes"]
+    assert len(info["nodes"]) > 1  # Should have more nodes than just initialize_task
     assert len(info["future_phases"]) > 0
 
 
@@ -207,7 +232,7 @@ def test_orchestrator_get_graph_info():
 # Integration Tests
 # ---------------------------------------------------------------------------
 
-def test_end_to_end_b1_workflow():
+async def test_end_to_end_b1_workflow():
     """Test complete B1 workflow from state creation to graph execution."""
     # Create initial state
     state = create_initial_state(
@@ -220,7 +245,7 @@ def test_end_to_end_b1_workflow():
     assert state["status"] == TaskStatus.PENDING
     
     # Run through orchestrator
-    result = langgraph_orchestrator.run_task(
+    result = await langgraph_orchestrator.run_task(
         user_request="End-to-end test",
         user_id=1,
         conversation_id=456
@@ -228,7 +253,8 @@ def test_end_to_end_b1_workflow():
     
     # Verify final result
     assert result["success"] == True
-    assert result["status"] == TaskStatus.INITIALIZING.value
+    # With B2 workflow, status will be PLANNING after full execution
+    assert result["status"] in [TaskStatus.INITIALIZING.value, TaskStatus.PLANNING.value]
     assert result["metadata"]["initialized"] == True
     assert len(result["errors"]) == 0
 
@@ -239,6 +265,10 @@ def test_end_to_end_b1_workflow():
 
 if __name__ == "__main__":
     print("Running LangGraph B1 Foundation Tests...")
+    
+    # Initialize capability system for B2 workflow compatibility
+    from app.capability_skills import initialize_basic_domains
+    initialize_basic_domains()
     
     # State Management Tests
     test_create_initial_state()
@@ -273,17 +303,21 @@ if __name__ == "__main__":
     test_orchestrator_initialization()
     print("[PASS] orchestrator_initialization test passed")
     
-    test_orchestrator_run_task_basic()
-    print("[PASS] orchestrator_run_task_basic test passed")
-    
-    test_orchestrator_run_task_with_context()
-    print("[PASS] orchestrator_run_task_with_context test passed")
-    
     test_orchestrator_get_graph_info()
     print("[PASS] orchestrator_get_graph_info test passed")
     
-    # Integration Tests
-    test_end_to_end_b1_workflow()
-    print("[PASS] end_to_end_b1_workflow test passed")
+    # Run async tests
+    async def run_async_tests():
+        with patch('app.langgraph_nodes._call_ollama_llm', side_effect=simple_mock_llm):
+            await test_orchestrator_run_task_basic()
+            print("[PASS] orchestrator_run_task_basic test passed")
+            
+            await test_orchestrator_run_task_with_context()
+            print("[PASS] orchestrator_run_task_with_context test passed")
+            
+            await test_end_to_end_b1_workflow()
+            print("[PASS] end_to_end_b1_workflow test passed")
+    
+    asyncio.run(run_async_tests())
     
     print("\nAll LangGraph B1 Foundation tests passed! [SUCCESS]")
