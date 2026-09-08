@@ -1,7 +1,28 @@
 import { useState, useRef, useEffect } from 'react'
-import { api, transcribeAudio, speakText, streamChat } from '../api.js'
+import { api, transcribeAudio, speakText, streamChat, uploadAttachment } from '../api.js'
 import { SendIcon, MicIcon } from '../icons.jsx'
 import { useAuth } from '../auth/AuthContext.jsx'
+
+function PaperclipIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+    </svg>
+  )
+}
+
+// One row per file type your backend classifies files into, purely for
+// the little emoji badge on each attachment chip.
+const FILE_TYPE_ICON = {
+  IMAGE: '🖼️',
+  PDF: '📄',
+  DOCX: '📝',
+  SPREADSHEET: '📊',
+  AUDIO: '🎵',
+  VIDEO: '🎥',
+  CODE: '💻',
+  OTHER: '📎',
+}
 
 export default function ChatView({ conversationId, setConversationId, model, onConversationsChanged }) {
   const { user } = useAuth()
@@ -20,11 +41,17 @@ export default function ChatView({ conversationId, setConversationId, model, onC
   const [speakReplies, setSpeakReplies] = useState(false)
   const [speaking, setSpeaking] = useState(false)
 
+  // Attachment state — each entry is { localId, id, filename, file_type,
+  // status: 'uploading' | 'ready' | 'error', error }. `id` is only set
+  // once the upload finishes and the backend has assigned it a row.
+  const [attachments, setAttachments] = useState([])
+
   const bottomRef = useRef(null)
   const textareaRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const chunksRef = useRef([])
   const audioElRef = useRef(null)
+  const fileInputRef = useRef(null)
 
   // Load history whenever the selected conversation changes.
   useEffect(() => {
@@ -38,6 +65,7 @@ export default function ChatView({ conversationId, setConversationId, model, onC
       .then((data) => setMessages(data.messages))
       .catch((err) => setError(err.message))
       .finally(() => setLoadingHistory(false))
+    setAttachments([])
   }, [conversationId])
 
   useEffect(() => {
@@ -52,9 +80,13 @@ export default function ChatView({ conversationId, setConversationId, model, onC
     }
   }, [])
 
+  const hasPendingUploads = attachments.some((a) => a.status === 'uploading')
+
   async function sendMessage(overrideText) {
     const text = (overrideText ?? input).trim()
-    if (!text || sending) return
+    if ((!text && attachments.length === 0) || sending || hasPendingUploads) return
+
+    const attachmentIds = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id)
 
     setError(null)
     // Push the user message plus an empty assistant placeholder that fills
@@ -65,15 +97,22 @@ export default function ChatView({ conversationId, setConversationId, model, onC
     setSending(true)
 
     try {
-      const { conversationId: newConvId, reply } = await streamChat(text, conversationId, model, (delta) => {
-        setMessages((prev) => {
-          const next = [...prev]
-          const last = next[next.length - 1]
-          next[next.length - 1] = { ...last, content: last.content + delta }
-          return next
-        })
-      })
+      const { conversationId: newConvId, reply } = await streamChat(
+        text,
+        conversationId,
+        model,
+        (delta) => {
+          setMessages((prev) => {
+            const next = [...prev]
+            const last = next[next.length - 1]
+            next[next.length - 1] = { ...last, content: last.content + delta }
+            return next
+          })
+        },
+        attachmentIds
+      )
       setConversationId(newConvId)
+      setAttachments([])
       onConversationsChanged()
       if (speakReplies && reply) {
         playReply(reply).catch(() => {})
@@ -91,6 +130,52 @@ export default function ChatView({ conversationId, setConversationId, model, onC
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       sendMessage()
+    }
+  }
+
+  // ---------------- Attachments ----------------
+
+  function handleAttachClick() {
+    fileInputRef.current?.click()
+  }
+
+  function handleFileChange(e) {
+    const files = Array.from(e.target.files || [])
+    e.target.value = '' // allow re-selecting the same file later
+    files.forEach(uploadOneFile)
+  }
+
+  async function uploadOneFile(file) {
+    const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    setAttachments((prev) => [
+      ...prev,
+      { localId, filename: file.name, file_type: null, status: 'uploading', error: null },
+    ])
+
+    try {
+      const record = await uploadAttachment(file, conversationId)
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.localId === localId
+            ? { ...a, id: record.id, filename: record.filename, file_type: record.file_type, status: 'ready' }
+            : a
+        )
+      )
+    } catch (err) {
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.localId === localId ? { ...a, status: 'error', error: err.message || 'Upload failed' } : a
+        )
+      )
+    }
+  }
+
+  function removeAttachment(localId) {
+    const target = attachments.find((a) => a.localId === localId)
+    setAttachments((prev) => prev.filter((a) => a.localId !== localId))
+    // Best-effort cleanup on the backend — the chip is already gone either way.
+    if (target?.id) {
+      api.deleteAttachment(target.id).catch(() => {})
     }
   }
 
@@ -248,7 +333,43 @@ export default function ChatView({ conversationId, setConversationId, model, onC
         <div ref={bottomRef} />
       </main>
 
+      {attachments.length > 0 && (
+        <div className="attachment-preview-row">
+          {attachments.map((a) => (
+            <div key={a.localId} className={`attachment-chip ${a.status}`}>
+              <span className="attachment-chip-icon">{FILE_TYPE_ICON[a.file_type] || '📎'}</span>
+              <span className="attachment-chip-name" title={a.filename}>{a.filename}</span>
+              {a.status === 'uploading' && <span className="attachment-chip-status">uploading…</span>}
+              {a.status === 'error' && <span className="attachment-chip-status error" title={a.error}>failed</span>}
+              <button
+                className="attachment-chip-remove"
+                onClick={() => removeAttachment(a.localId)}
+                title="Remove attachment"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <footer className="composer">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          onChange={handleFileChange}
+          accept=".jpg,.jpeg,.png,.webp,.gif,.heic,.pdf,.docx,.xlsx,.xls,.csv,.mp3,.wav,.m4a,.ogg,.mp4,.mov,.webm,.mkv,.py,.js,.jsx,.ts,.tsx,.java,.c,.cpp,.go,.rs,.rb,.php,.sql,.json,.yaml,.yml,.html,.css,.sh,.md,.txt"
+        />
+        <button
+          className="attach-btn"
+          onClick={handleAttachClick}
+          disabled={transcribing}
+          title="Attach a file"
+        >
+          <PaperclipIcon />
+        </button>
         <button
           className={`mic-btn ${recording ? 'recording' : ''}`}
           onClick={handleMicClick}
@@ -266,7 +387,11 @@ export default function ChatView({ conversationId, setConversationId, model, onC
           rows={1}
           disabled={transcribing}
         />
-        <button className="send-btn" onClick={() => sendMessage()} disabled={sending || transcribing || !input.trim()}>
+        <button
+          className="send-btn"
+          onClick={() => sendMessage()}
+          disabled={sending || transcribing || hasPendingUploads || (!input.trim() && attachments.length === 0)}
+        >
           Send <SendIcon />
         </button>
       </footer>

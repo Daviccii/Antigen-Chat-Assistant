@@ -82,6 +82,24 @@ export async function transcribeAudio(blob) {
   return ok.json() // { text }
 }
 
+// Uploads a file attachment, optionally tied to an existing conversation.
+// Not routed through req() because this needs a multipart body, not JSON.
+// Returns the attachment record: { id, filename, file_type, status, ... }
+export async function uploadAttachment(file, conversationId) {
+  const form = new FormData()
+  form.append('file', file)
+  if (conversationId) {
+    form.append('conversation_id', conversationId)
+  }
+  const res = await fetch(`${API_BASE}/attachments`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
+  })
+  const ok = await handleVoiceResponse(res) // generic 401/error handling, name aside
+  return ok.json()
+}
+
 // Sends text to be spoken and returns an audio Blob (audio/wav).
 // Not routed through req() because the response is binary, not JSON.
 export async function speakText(text, voice) {
@@ -98,11 +116,16 @@ export async function speakText(text, voice) {
 // onDelta(deltaText, fullTextSoFar), instead of waiting for the whole
 // reply to generate before returning anything. Not routed through req()
 // because the response body is a stream of NDJSON lines, not one JSON blob.
-export async function streamChat(message, conversationId, model, onDelta) {
+export async function streamChat(message, conversationId, model, onDelta, attachmentIds) {
   const res = await fetch(`${API_BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ message, conversation_id: conversationId, model }),
+    body: JSON.stringify({
+      message,
+      conversation_id: conversationId,
+      model,
+      attachment_ids: attachmentIds && attachmentIds.length ? attachmentIds : undefined,
+    }),
   })
 
   if (res.status === 401) {
@@ -197,4 +220,9 @@ export const api = {
     req('/memories/semantic_search', { method: 'POST', body: JSON.stringify({ query }) }),
 
   listVoices: () => req('/voice/voices'),
+
+  listAttachments: (conversationId) =>
+    req(`/attachments${conversationId ? `?conversation_id=${conversationId}` : ''}`),
+
+  deleteAttachment: (id) => req(`/attachments/${id}`, { method: 'DELETE' }),
 }

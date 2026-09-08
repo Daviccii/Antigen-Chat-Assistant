@@ -32,6 +32,8 @@ from .services import (
     generate_and_store_embedding as svc_generate_embedding,
     batch_generate_embeddings as svc_batch_generate,
 )
+from .attachment_processing import build_attachment_context
+from .attachment_models import Attachment
 from .auth import get_current_active_user, require_owner, create_access_token
 from .auth_service import AuthService
 from .voice import router as voice_router
@@ -251,6 +253,7 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[int] = None
     model: str = "gpt-4o-mini"
+    attachment_ids: Optional[List[int]] = None
 
 
 def get_db():
@@ -463,14 +466,34 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_active
     tracker.mark("history_loaded")
 
     openai_messages = [{"role": "system", "content": build_system_prompt(current_user, db, query_text=req.message, conversation_id=conv.id)}]
+
+    attachment_context = build_attachment_context(db, current_user.id, req.attachment_ids or [])
+    if attachment_context:
+        openai_messages[0]["content"] += "\n\n" + attachment_context
+
     openai_messages += [{"role": m.role, "content": m.content} for m in history]
     openai_messages.append({"role": "user", "content": req.message})
 
     tracker.mark("context_built")
 
     # Persist only the new user message now.
-    db.add(MessageModel(conversation_id=conv.id, role="user", content=req.message))
+    user_message = MessageModel(conversation_id=conv.id, role="user", content=req.message)
+    db.add(user_message)
     db.commit()
+    db.refresh(user_message)
+
+    # Retroactively associate any referenced attachments with this
+    # conversation/message — they may have been uploaded before the
+    # conversation existed yet (conversation_id was null at upload time).
+    if req.attachment_ids:
+        db.query(Attachment).filter(
+            Attachment.id.in_(req.attachment_ids),
+            Attachment.user_id == current_user.id,
+        ).update(
+            {"conversation_id": conv.id, "message_id": user_message.id},
+            synchronize_session=False,
+        )
+        db.commit()
 
     tracker.mark("user_message_saved")
     

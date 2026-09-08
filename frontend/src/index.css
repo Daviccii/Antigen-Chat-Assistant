@@ -855,3 +855,91 @@ body {
   color: var(--ink-dim);
   font-size: 13px;
 }
+
+/* ---------- Attachments ---------- */
+
+.attach-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: var(--panel);
+  color: var(--ink-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.attach-btn:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--panel-2);
+}
+
+.attach-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.attachment-preview-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 28px 10px;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 6px 10px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  font-size: 13px;
+  color: var(--ink);
+  max-width: 220px;
+}
+
+.attachment-chip.uploading {
+  opacity: 0.65;
+}
+
+.attachment-chip.error {
+  border-color: var(--bad);
+}
+
+.attachment-chip-icon {
+  font-size: 14px;
+}
+
+.attachment-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+}
+
+.attachment-chip-status {
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.attachment-chip-status.error {
+  color: var(--bad);
+}
+
+.attachment-chip-remove {
+  background: none;
+  border: none;
+  color: var(--ink-dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.attachment-chip-remove:hover {
+  color: var(--ink);
+}

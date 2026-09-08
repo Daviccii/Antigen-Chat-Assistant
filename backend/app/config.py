@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
     FRONTEND_URL: str = "http://localhost:5173"
 
+    UPLOAD_DIR: str = "storage/uploads"
+    MAX_UPLOAD_SIZE_MB: int = 25
+
     # env_file_encoding='utf-8-sig' strips a leading BOM if one is present
     # (common when a .env is created via PowerShell's Out-File -Encoding utf8),
     # and is harmless for files that don't have one.
