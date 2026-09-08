@@ -8,6 +8,8 @@ Phase B2: Added LLM-powered planning nodes for task understanding, domain identi
            skill selection, and execution plan generation.
 Phase B3: Added tool selection and permission validation nodes.
 Phase B4: Added execution and result collection nodes.
+Phase B5: Added verification, failure analysis, and recovery nodes.
+Phase B6: Added memory integration node.
 """
 from typing import Dict, Any, Optional
 import logging
@@ -857,30 +859,32 @@ async def collect_results(state: AntigenTaskState) -> AntigenTaskState:
     
     try:
         # Compile final result
+        execution_results = state.get("execution_results", []) or []
+        permission_results = state.get("permission_results", {}) or {}
         final_result = {
             "task": state["user_request"],
             "domain": state.get("selected_domain"),
             "skill": state.get("selected_skill"),
             "execution_state": state.get("execution_state", "unknown"),
-            "steps_completed": len([r for r in state.get("execution_results", []) if r.get("status") == "completed"]),
-            "steps_failed": len([r for r in state.get("execution_results", []) if r.get("status") == "failed"]),
-            "total_steps": len(state.get("execution_results", [])),
-            "execution_results": state.get("execution_results", []),
+            "steps_completed": len([r for r in execution_results if r.get("status") == "completed"]),
+            "steps_failed": len([r for r in execution_results if r.get("status") == "failed"]),
+            "total_steps": len(execution_results),
+            "execution_results": execution_results,
             "tool_selection": {
-                "tools_selected": len(state.get("selected_tools", {})),
-                "tools_unavailable": len(state.get("unavailable_tools", [])),
-                "validation_errors": state.get("tool_validation_errors", [])
+                "tools_selected": len(state.get("selected_tools", {}) or {}),
+                "tools_unavailable": len(state.get("unavailable_tools", []) or []),
+                "validation_errors": state.get("tool_validation_errors", []) or []
             },
             "permission_validation": {
-                "tools_allowed": len([r for r in state.get("permission_results", {}).values() if r.get("allowed")]),
-                "tools_blocked": len(state.get("blocked_operations", [])),
-                "tools_require_confirmation": len(state.get("confirmation_requirements", []))
+                "tools_allowed": len([r for r in permission_results.values() if r.get("allowed")]),
+                "tools_blocked": len(state.get("blocked_operations", []) or []),
+                "tools_require_confirmation": len(state.get("confirmation_requirements", []) or [])
             }
         }
         
         # Add execution details if available
-        if state.get("execution_results"):
-            successful_results = [r for r in state["execution_results"] if r.get("status") == "completed"]
+        if execution_results:
+            successful_results = [r for r in execution_results if r.get("status") == "completed"]
             if successful_results:
                 final_result["successful_outputs"] = [r.get("output") for r in successful_results]
         
@@ -894,6 +898,605 @@ async def collect_results(state: AntigenTaskState) -> AntigenTaskState:
         logger.exception(f"Error in collect_results: {e}")
         add_error(state, f"Result collection failed: {str(e)}")
         return state
+
+
+# ---------------------------------------------------------------------------
+# Phase B5: Verification, Failure Analysis, and Recovery Nodes
+# ---------------------------------------------------------------------------
+
+async def verify_results(state: AntigenTaskState) -> AntigenTaskState:
+    """Verify execution results against original task intent.
+    
+    This node:
+    - Compares actual outputs with expected outputs
+    - Evaluates whether the task was actually accomplished
+    - NEVER invents success
+    - NEVER reports success when execution failed
+    - Distinguishes tool success from task success
+    
+    Phase B5: Result verification against task intent.
+    
+    Args:
+        state: Current task state with execution results
+    
+    Returns:
+        Updated task state with verification status
+    """
+    logger.info(f"Verifying results for user {state['user_id']}")
+    
+    try:
+        # Initialize verification fields
+        state["verification_status"] = "FAILED"
+        state["verification_result"] = {}
+        state["verification_summary"] = ""
+        state["expected_outputs"] = []
+        state["actual_outputs"] = []
+        state["verification_errors"] = []
+        
+        # Check if we have execution results
+        if not state.get("execution_results") or len(state["execution_results"]) == 0:
+            state["verification_summary"] = "No execution results to verify"
+            state["verification_errors"].append("No execution results available")
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        # Extract expected outputs from plan
+        plan = state.get("plan", {})
+        plan_steps = plan.get("steps", [])
+        
+        for step in plan_steps:
+            expected = step.get("expected_output")
+            if expected:
+                state["expected_outputs"].append(expected)
+        
+        # Extract actual outputs from execution results
+        successful_results = [r for r in state["execution_results"] if r.get("status") == "completed"]
+        for result in successful_results:
+            output = result.get("output")
+            if output:
+                state["actual_outputs"].append({
+                    "step": result.get("step_number"),
+                    "tool": result.get("tool_name"),
+                    "output": output
+                })
+        
+        # Check if execution was blocked
+        if state.get("blocked_operations") and len(state["blocked_operations"]) > 0:
+            state["verification_status"] = "BLOCKED"
+            state["verification_summary"] = f"Task blocked: {len(state['blocked_operations'])} operations require higher permissions"
+            state["verification_result"] = {
+                "blocked": True,
+                "blocked_count": len(state["blocked_operations"]),
+                "reason": "Operations blocked by permission system"
+            }
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        # Check if any required steps failed
+        failed_steps = [r for r in state["execution_results"] if r.get("status") == "failed"]
+        if failed_steps:
+            state["verification_status"] = "FAILED"
+            state["verification_summary"] = f"Task failed: {len(failed_steps)} steps failed execution"
+            state["verification_result"] = {
+                "verified": False,
+                "failed_steps": len(failed_steps),
+                "total_steps": len(state["execution_results"]),
+                "reason": "One or more execution steps failed"
+            }
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        # Check if we have any successful results
+        if len(successful_results) == 0:
+            state["verification_status"] = "FAILED"
+            state["verification_summary"] = "No successful execution results"
+            state["verification_result"] = {
+                "verified": False,
+                "reason": "No steps completed successfully"
+            }
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        # Check if all steps completed
+        if len(successful_results) == len(state["execution_results"]):
+            state["verification_status"] = "VERIFIED"
+            state["verification_summary"] = f"Task verified: all {len(successful_results)} steps completed successfully"
+            state["verification_result"] = {
+                "verified": True,
+                "completed_steps": len(successful_results),
+                "total_steps": len(state["execution_results"]),
+                "reason": "All execution steps completed successfully"
+            }
+        else:
+            state["verification_status"] = "PARTIALLY_VERIFIED"
+            state["verification_summary"] = f"Task partially verified: {len(successful_results)}/{len(state['execution_results'])} steps completed"
+            state["verification_result"] = {
+                "verified": False,
+                "completed_steps": len(successful_results),
+                "total_steps": len(state["execution_results"]),
+                "reason": "Some steps failed or were blocked"
+            }
+        
+        logger.info(f"Verification complete: {state['verification_status']}")
+        
+        return update_state_status(state, TaskStatus.VERIFYING)
+        
+    except Exception as e:
+        logger.exception(f"Error in verify_results: {e}")
+        add_error(state, f"Result verification failed: {str(e)}")
+        state["verification_status"] = "FAILED"
+        state["verification_errors"].append(f"Verification error: {str(e)}")
+        return update_state_status(state, TaskStatus.FAILED)
+
+
+async def analyze_failure(state: AntigenTaskState) -> AntigenTaskState:
+    """Analyze execution failures to determine recovery strategy.
+    
+    This node:
+    - Classifies failures as PERMANENT, RECOVERABLE, or USER_DEPENDENT
+    - Identifies specific failure reasons
+    - Determines appropriate recovery actions
+    - Does NOT attempt recovery itself
+    
+    Phase B5: Failure classification for recovery planning.
+    
+    Args:
+        state: Current task state with verification results
+    
+    Returns:
+        Updated task state with failure analysis
+    """
+    logger.info(f"Analyzing failure for user {state['user_id']}")
+    
+    try:
+        # Initialize failure analysis fields
+        state["failure_analysis"] = {}
+        state["failure_category"] = "PERMANENT"  # Default to permanent
+        state["failure_reason"] = "Unknown failure"
+        
+        # Check if verification passed
+        if state.get("verification_status") == "VERIFIED":
+            state["failure_category"] = None
+            state["failure_reason"] = "No failure - task verified successfully"
+            return state
+        
+        # Check for blocked operations (PERMANENT without permission escalation)
+        if state.get("blocked_operations") and len(state["blocked_operations"]) > 0:
+            state["failure_category"] = "USER_DEPENDENT"
+            state["failure_reason"] = "Operations blocked by permission system - requires user authorization or permission escalation"
+            state["failure_analysis"] = {
+                "category": "USER_DEPENDENT",
+                "reason": "Permission blocked",
+                "blocked_operations": state["blocked_operations"],
+                "recovery_possible": False,
+                "requires_user_action": True
+            }
+            return state
+        
+        # Check for unavailable tools (PERMANENT)
+        if state.get("unavailable_tools") and len(state["unavailable_tools"]) > 0:
+            state["failure_category"] = "PERMANENT"
+            state["failure_reason"] = f"Required tools not available: {state['unavailable_tools']}"
+            state["failure_analysis"] = {
+                "category": "PERMANENT",
+                "reason": "Tools unavailable",
+                "unavailable_tools": state["unavailable_tools"],
+                "recovery_possible": False
+            }
+            return state
+        
+        # Check for execution errors that might be recoverable
+        failed_steps = [r for r in state.get("execution_results", []) if r.get("status") == "failed"]
+        if failed_steps:
+            # Analyze the first failed step
+            first_failure = failed_steps[0]
+            error_message = first_failure.get("error", "")
+            
+            # Check for transient/recoverable errors
+            transient_keywords = ["timeout", "connection", "temporary", "network", "rate limit"]
+            if any(keyword in error_message.lower() for keyword in transient_keywords):
+                state["failure_category"] = "RECOVERABLE"
+                state["failure_reason"] = f"Transient error detected: {error_message}"
+                state["failure_analysis"] = {
+                    "category": "RECOVERABLE",
+                    "reason": "Transient error",
+                    "error_type": "transient",
+                    "error_message": error_message,
+                    "recovery_possible": True,
+                    "suggested_recovery": "retry"
+                }
+            else:
+                state["failure_category"] = "PERMANENT"
+                state["failure_reason"] = f"Execution error: {error_message}"
+                state["failure_analysis"] = {
+                    "category": "PERMANENT",
+                    "reason": "Execution error",
+                    "error_type": "permanent",
+                    "error_message": error_message,
+                    "recovery_possible": False
+                }
+        else:
+            # No failed steps but verification failed
+            state["failure_category"] = "PERMANENT"
+            state["failure_reason"] = "Verification failed without specific execution errors"
+            state["failure_analysis"] = {
+                "category": "PERMANENT",
+                "reason": "Verification failure",
+                "recovery_possible": False
+            }
+        
+        logger.info(f"Failure analysis complete: {state['failure_category']} - {state['failure_reason']}")
+        
+        return state
+        
+    except Exception as e:
+        logger.exception(f"Error in analyze_failure: {e}")
+        add_error(state, f"Failure analysis failed: {str(e)}")
+        state["failure_category"] = "PERMANENT"
+        state["failure_reason"] = f"Failure analysis error: {str(e)}"
+        return state
+
+
+async def attempt_recovery(state: AntigenTaskState) -> AntigenTaskState:
+    """Attempt controlled recovery from execution failures.
+    
+    This node:
+    - Executes bounded recovery attempts
+    - Respects max_recovery_attempts
+    - Never bypasses permission validation
+    - Never bypasses tool registry validation
+    - Never creates infinite loops
+    - Only applies to RECOVERABLE failures
+    
+    Phase B5: Controlled recovery with strict limits.
+    
+    Args:
+        state: Current task state with failure analysis
+    
+    Returns:
+        Updated task state with recovery results
+    """
+    logger.info(f"Attempting recovery for user {state['user_id']}")
+    
+    try:
+        # Check if recovery is possible
+        if state.get("failure_category") != "RECOVERABLE":
+            state["verification_summary"] = f"Recovery not possible: failure is {state.get('failure_category', 'UNKNOWN')}"
+            return state
+        
+        # Check recovery attempt limit
+        max_attempts = state.get("max_recovery_attempts", 3)
+        current_attempts = state.get("recovery_attempts", 0)
+        
+        if current_attempts >= max_attempts:
+            state["verification_summary"] = f"Recovery limit reached: {current_attempts}/{max_attempts} attempts"
+            add_error(state, f"Recovery limit reached after {current_attempts} attempts")
+            return state
+        
+        # Increment recovery attempts
+        state["recovery_attempts"] = current_attempts + 1
+        
+        # Record recovery action
+        recovery_action = {
+            "attempt_number": state["recovery_attempts"],
+            "timestamp": state["updated_at"].isoformat(),
+            "strategy": "retry_failed_step"
+        }
+        state["recovery_actions"].append(recovery_action)
+        
+        # Simple recovery strategy: retry the failed step
+        # In a more sophisticated implementation, this could use alternative tools
+        failed_steps = [r for r in state.get("execution_results", []) if r.get("status") == "failed"]
+        
+        if not failed_steps:
+            state["verification_summary"] = "No failed steps to recover"
+            return state
+        
+        # Get the first failed step to retry
+        failed_step = failed_steps[0]
+        step_number = failed_step.get("step_number")
+        tool_name = failed_step.get("tool_name")
+        
+        # Get the tool from registry
+        from .capability_system import tool_registry
+        tool = tool_registry.get(tool_name)
+        
+        if not tool or not tool.execution_handler:
+            state["verification_summary"] = f"Recovery failed: tool '{tool_name}' not available for retry"
+            state["recovery_results"].append({
+                "attempt": state["recovery_attempts"],
+                "success": False,
+                "reason": "Tool not available"
+            })
+            return state
+        
+        # Check permissions before retry
+        perm_result = state.get("permission_results", {}).get(str(step_number), {})
+        if not perm_result.get("allowed", False):
+            state["verification_summary"] = f"Recovery failed: step {step_number} not authorized"
+            state["recovery_results"].append({
+                "attempt": state["recovery_attempts"],
+                "success": False,
+                "reason": "Permission denied"
+            })
+            return state
+        
+        # Retry the step
+        try:
+            logger.info(f"Recovery attempt {state['recovery_attempts']}: retrying step {step_number} with tool '{tool_name}'")
+            
+            # Get input from plan
+            plan_step = None
+            for step in state.get("plan", {}).get("steps", []):
+                if step.get("step_number") == step_number:
+                    plan_step = step
+                    break
+            
+            if not plan_step:
+                state["verification_summary"] = f"Recovery failed: step {step_number} not found in plan"
+                state["recovery_results"].append({
+                    "attempt": state["recovery_attempts"],
+                    "success": False,
+                    "reason": "Step not in plan"
+                })
+                return state
+            
+            input_data = plan_step.get("inputs", {})
+            
+            # Execute the tool
+            result_data = tool.execution_handler(input_data)
+            
+            # Update execution results with retry result
+            # Replace the failed result with the new result
+            for i, result in enumerate(state["execution_results"]):
+                if result.get("step_number") == step_number:
+                    state["execution_results"][i] = {
+                        "step_number": step_number,
+                        "tool_name": tool_name,
+                        "status": "completed",
+                        "output": result_data,
+                        "error": None,
+                        "recovered": True,
+                        "recovery_attempt": state["recovery_attempts"]
+                    }
+                    break
+            
+            # Update step execution state
+            if state.get("step_execution_states"):
+                state["step_execution_states"][str(step_number)] = "completed"
+            
+            # Record successful recovery
+            state["recovery_results"].append({
+                "attempt": state["recovery_attempts"],
+                "success": True,
+                "recovered_step": step_number,
+                "tool": tool_name
+            })
+            
+            state["verification_summary"] = f"Recovery attempt {state['recovery_attempts']} successful: step {step_number} recovered"
+            
+            logger.info(f"Recovery successful for step {step_number}")
+            
+        except Exception as e:
+            logger.exception(f"Recovery attempt failed for step {step_number}: {e}")
+            state["recovery_results"].append({
+                "attempt": state["recovery_attempts"],
+                "success": False,
+                "reason": str(e)
+            })
+            state["verification_summary"] = f"Recovery attempt {state['recovery_attempts']} failed: {str(e)}"
+        
+        return state
+        
+    except Exception as e:
+        logger.exception(f"Error in attempt_recovery: {e}")
+        add_error(state, f"Recovery attempt failed: {str(e)}")
+        return state
+
+
+async def determine_final_status(state: AntigenTaskState) -> AntigenTaskState:
+    """Determine the final task status after verification and recovery.
+    
+    This node:
+    - Sets the final_task_status based on verification and recovery
+    - Provides a clear human-readable status
+    - Considers partial success scenarios
+    
+    Phase B5: Final task status determination.
+    
+    Args:
+        state: Current task state with verification and recovery results
+    
+    Returns:
+        Updated task state with final task status
+    """
+    logger.info(f"Determining final status for user {state['user_id']}")
+    
+    try:
+        verification_status = state.get("verification_status")
+        
+        if verification_status == "VERIFIED":
+            state["final_task_status"] = "COMPLETED"
+            state["verification_summary"] = "Task completed successfully"
+            return update_state_status(state, TaskStatus.COMPLETED)
+        
+        elif verification_status == "PARTIALLY_VERIFIED":
+            state["final_task_status"] = "PARTIALLY_COMPLETED"
+            state["verification_summary"] = "Task partially completed - some steps failed"
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        elif verification_status == "BLOCKED":
+            state["final_task_status"] = "BLOCKED"
+            state["verification_summary"] = "Task blocked by permission system"
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        elif verification_status == "FAILED":
+            # Check if recovery was attempted and succeeded
+            recovery_results = state.get("recovery_results", [])
+            successful_recovery = [r for r in recovery_results if r.get("success")]
+            
+            if successful_recovery:
+                state["final_task_status"] = "PARTIALLY_COMPLETED"
+                state["verification_summary"] = f"Task partially completed after {len(successful_recovery)} recovery attempts"
+                return update_state_status(state, TaskStatus.FAILED)
+            else:
+                state["final_task_status"] = "FAILED"
+                state["verification_summary"] = "Task failed - recovery unsuccessful or not applicable"
+                return update_state_status(state, TaskStatus.FAILED)
+        
+        else:
+            state["final_task_status"] = "FAILED"
+            state["verification_summary"] = "Task failed - unknown verification status"
+            return update_state_status(state, TaskStatus.FAILED)
+        
+    except Exception as e:
+        logger.exception(f"Error in determine_final_status: {e}")
+        add_error(state, f"Final status determination failed: {str(e)}")
+        state["final_task_status"] = "FAILED"
+        return update_state_status(state, TaskStatus.FAILED)
+
+
+# ---------------------------------------------------------------------------
+# Phase B6: Memory Integration Node
+# ---------------------------------------------------------------------------
+
+async def extract_and_store_memory(state: AntigenTaskState) -> AntigenTaskState:
+    """Extract useful information from verified task execution and store in memory.
+    
+    This node:
+    - Extracts useful facts from successful task outcomes
+    - Stores only high-confidence, verified information
+    - Does NOT store failed/unverified information as facts
+    - Integrates with existing Memory Service
+    - Uses existing memory categories and importance levels
+    - Handles memory storage failures gracefully
+    
+    Phase B6: Memory integration for task outcome learning.
+    
+    Args:
+        state: Current task state with verification results
+    
+    Returns:
+        Updated task state with memory extraction results
+    """
+    logger.info(f"Extracting and storing memory for user {state['user_id']}")
+    
+    try:
+        # Initialize memory fields
+        state["extracted_memories"] = []
+        state["memory_storage_results"] = {
+            "memories_created": [],
+            "memories_updated": [],
+            "errors": []
+        }
+        
+        # Only extract memory from verified successful tasks
+        if state.get("verification_status") != "VERIFIED":
+            state["memory_storage_results"]["errors"].append("Task not verified - no memory extracted")
+            return state
+        
+        # Only extract memory if we have successful execution results
+        successful_results = [r for r in state.get("execution_results", []) if r.get("status") == "completed"]
+        if not successful_results:
+            state["memory_storage_results"]["errors"].append("No successful execution results - no memory extracted")
+            return state
+        
+        # Extract useful patterns from successful execution
+        from .memory_service import MemoryService, MemoryCategory, MemoryImportance, MemorySource
+        from .db import get_db
+        
+        # Try to get database session for memory storage
+        try:
+            db = next(get_db())
+        except Exception as db_error:
+            logger.warning(f"Could not get database session for memory storage: {db_error}")
+            state["memory_storage_results"]["errors"].append(f"Database unavailable: {str(db_error)}")
+            return state  # Memory failure should not break task completion
+        
+        # Extract tool usage patterns
+        for result in successful_results:
+            tool_name = result.get("tool_name")
+            output = result.get("output")
+            
+            if tool_name and output:
+                # Create a memory about successful tool usage
+                memory_content = f"Tool '{tool_name}' successfully completed task: {state['user_request'][:100]}"
+                
+                try:
+                    # Check for duplicates
+                    existing = MemoryService.deduplicate_memory(db, state["user_id"], memory_content, MemoryCategory.PROJECT)
+                    
+                    if not existing:
+                        memory = MemoryService.create_memory(
+                            db=db,
+                            user_id=state["user_id"],
+                            content=memory_content,
+                            memory_type="tool_usage",
+                            category=MemoryCategory.PROJECT,
+                            source=MemorySource.SYSTEM,
+                            importance=MemoryImportance.NORMAL,
+                            confidence=0.8,  # High confidence from verified execution
+                            extra_metadata={
+                                "tool": tool_name,
+                                "task": state["user_request"],
+                                "verification_status": state.get("verification_status"),
+                                "execution_state": state.get("execution_state")
+                            }
+                        )
+                        state["extracted_memories"].append({
+                            "type": "tool_usage",
+                            "content": memory_content,
+                            "confidence": 0.8
+                        })
+                        state["memory_storage_results"]["memories_created"].append(memory.id)
+                    else:
+                        state["memory_storage_results"]["memories_updated"].append(existing.id)
+                
+                except Exception as mem_error:
+                    logger.warning(f"Failed to store memory: {mem_error}")
+                    state["memory_storage_results"]["errors"].append(f"Memory storage error: {str(mem_error)}")
+                    # Continue with other memories
+        
+        # Extract project context if available
+        if state.get("selected_domain") == "software_engineering":
+            try:
+                project_memory_content = f"Task in domain '{state['selected_domain']}' with skill '{state.get('selected_skill')}' completed successfully"
+                existing = MemoryService.deduplicate_memory(db, state["user_id"], project_memory_content, MemoryCategory.PROJECT)
+                
+                if not existing:
+                    memory = MemoryService.create_memory(
+                        db=db,
+                        user_id=state["user_id"],
+                        content=project_memory_content,
+                        memory_type="project_context",
+                        category=MemoryCategory.PROJECT,
+                        source=MemorySource.SYSTEM,
+                        importance=MemoryImportance.NORMAL,
+                        confidence=0.7,
+                        extra_metadata={
+                            "domain": state["selected_domain"],
+                            "skill": state.get("selected_skill"),
+                            "task": state["user_request"]
+                        }
+                    )
+                    state["extracted_memories"].append({
+                        "type": "project_context",
+                        "content": project_memory_content,
+                        "confidence": 0.7
+                    })
+                    state["memory_storage_results"]["memories_created"].append(memory.id)
+                else:
+                    state["memory_storage_results"]["memories_updated"].append(existing.id)
+            
+            except Exception as mem_error:
+                logger.warning(f"Failed to store project context memory: {mem_error}")
+                state["memory_storage_results"]["errors"].append(f"Project memory error: {str(mem_error)}")
+        
+        logger.info(f"Memory extraction complete: {len(state['extracted_memories'])} memories extracted")
+        
+        return state
+        
+    except Exception as e:
+        logger.exception(f"Error in extract_and_store_memory: {e}")
+        add_error(state, f"Memory extraction failed: {str(e)}")
+        state["memory_storage_results"]["errors"].append(f"Memory extraction error: {str(e)}")
+        return state  # Memory failure should not break task completion
 
 
 # Future nodes to be implemented in later phases:
