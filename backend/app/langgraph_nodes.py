@@ -616,9 +616,15 @@ async def validate_permissions(state: AntigenTaskState) -> AntigenTaskState:
             permission_hierarchy = {
                 PermissionLevel.READ_ONLY: 0,
                 PermissionLevel.SAFE_ACTION: 1,
-                PermissionLevel.REQUIRES_CONFIRMATION: 2,
-                PermissionLevel.RESTRICTED: 3
+                PermissionLevel.MODIFY: 2,
+                PermissionLevel.DESTRUCTIVE: 3,
+                PermissionLevel.ADMIN: 4,
+                PermissionLevel.RESTRICTED: 5
             }
+            # Tiers that need a confirmation/authorization step rather than
+            # an outright block — see security_gateway.CONFIRMATION_POLICY
+            # for the authoritative version of this used by the real gate.
+            CONFIRMATION_TIERS = (PermissionLevel.MODIFY, PermissionLevel.DESTRUCTIVE, PermissionLevel.ADMIN)
             
             user_level = permission_hierarchy.get(user_permission_level, 0)
             tool_level = permission_hierarchy.get(tool_permission, 0)
@@ -633,11 +639,11 @@ async def validate_permissions(state: AntigenTaskState) -> AntigenTaskState:
                         "required": tool_permission_str,
                         "action": "blocked"
                     }
-                elif tool_permission == PermissionLevel.REQUIRES_CONFIRMATION:
-                    state["confirmation_requirements"].append(f"Step {step_number}: {tool_name} (REQUIRES_CONFIRMATION)")
+                elif tool_permission in CONFIRMATION_TIERS:
+                    state["confirmation_requirements"].append(f"Step {step_number}: {tool_name} ({tool_permission_str})")
                     state["permission_results"][step_number] = {
                         "allowed": False,
-                        "reason": "Operation requires user confirmation",
+                        "reason": f"Operation requires user confirmation ({tool_permission_str})",
                         "required": tool_permission_str,
                         "action": "confirmation_required"
                     }
@@ -706,6 +712,8 @@ async def execute_plan(state: AntigenTaskState) -> AntigenTaskState:
     
     try:
         from .capability_system import tool_registry
+        from .gated_execution import execute_tool_gated
+        from .db import get_db
         
         # Initialize execution state
         state["execution_state"] = "running"
@@ -722,6 +730,17 @@ async def execute_plan(state: AntigenTaskState) -> AntigenTaskState:
         if state.get("blocked_operations"):
             state["execution_state"] = "blocked"
             add_error(state, f"Execution blocked: {len(state['blocked_operations'])} operations require higher permissions")
+            return update_state_status(state, TaskStatus.FAILED)
+        
+        # One db session for every step's gateway check in this run —
+        # mirrors the get_db() pattern the B6 memory-integration node
+        # already uses further down in this file.
+        try:
+            gateway_db = next(get_db())
+        except Exception as db_error:
+            logger.warning(f"Could not get database session for Security Gateway checks: {db_error}")
+            state["execution_state"] = "failed"
+            add_error(state, f"Security Gateway unavailable (no db session): {db_error}")
             return update_state_status(state, TaskStatus.FAILED)
         
         # Execute each step sequentially
@@ -777,8 +796,27 @@ async def execute_plan(state: AntigenTaskState) -> AntigenTaskState:
                 # Prepare input data
                 input_data = step.get("inputs", {})
                 
-                # Call the tool's execution handler
-                result_data = tool.execution_handler(input_data)
+                # Everything past this point is decided by the Security
+                # Gateway — kill switch, category switch, allowed-areas,
+                # RESTRICTED hard-block, audit logging. The permission_results
+                # check above (from the B3 validate_permissions node) is a
+                # fast pre-filter only; it doesn't know about this user's
+                # real settings the way the gateway does.
+                gateway_outcome = execute_tool_gated(gateway_db, state["user_id"], tool, input_data)
+
+                if not gateway_outcome.success:
+                    state["step_execution_states"][step_key] = (
+                        "confirmation_required" if gateway_outcome.metadata.get("needs_confirmation") else "blocked"
+                    )
+                    state["execution_results"].append({
+                        "step_number": step_number,
+                        "tool_name": tool_name,
+                        "status": state["step_execution_states"][step_key],
+                        "error": gateway_outcome.error
+                    })
+                    continue
+
+                result_data = gateway_outcome.data
                 
                 # Store successful result
                 state["step_execution_states"][step_key] = "completed"
@@ -1239,8 +1277,33 @@ async def attempt_recovery(state: AntigenTaskState) -> AntigenTaskState:
             
             input_data = plan_step.get("inputs", {})
             
-            # Execute the tool
-            result_data = tool.execution_handler(input_data)
+            # Same gateway check as the main execution node — a retry is
+            # still a real tool call and gets evaluated (and audited) the
+            # same way, not treated as pre-approved because it ran once.
+            from .gated_execution import execute_tool_gated
+            from .db import get_db
+            try:
+                recovery_db = next(get_db())
+            except Exception as db_error:
+                state["verification_summary"] = f"Recovery failed: no database session for Security Gateway check ({db_error})"
+                state["recovery_results"].append({
+                    "attempt": state["recovery_attempts"],
+                    "success": False,
+                    "reason": "Database unavailable for gateway check"
+                })
+                return state
+
+            gateway_outcome = execute_tool_gated(recovery_db, state["user_id"], tool, input_data)
+            if not gateway_outcome.success:
+                state["verification_summary"] = f"Recovery failed: {gateway_outcome.error}"
+                state["recovery_results"].append({
+                    "attempt": state["recovery_attempts"],
+                    "success": False,
+                    "reason": gateway_outcome.error
+                })
+                return state
+
+            result_data = gateway_outcome.data
             
             # Update execution results with retry result
             # Replace the failed result with the new result

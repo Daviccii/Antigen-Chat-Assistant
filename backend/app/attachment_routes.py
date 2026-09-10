@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .attachment_models import Attachment, AttachmentStatus
+from .security_models import TrustLevel
 from .attachment_security import (
     classify_and_validate, compute_sha256, generate_storage_path,
     AttachmentRejected, MAX_UPLOAD_SIZE_BYTES,
@@ -104,6 +105,7 @@ async def upload_attachment(
         file_type=file_type,
         size_bytes=len(content),
         status=AttachmentStatus.UPLOADED,
+        trust_level=TrustLevel.UNTRUSTED,
     )
     db.add(attachment)
     db.commit()
@@ -199,6 +201,7 @@ def _attachment_to_dict(a: Attachment) -> dict:
         "file_type": a.file_type.value,
         "size_bytes": a.size_bytes,
         "status": a.status.value,
+        "trust_level": a.trust_level.value,
         "created_at": a.created_at.isoformat(),
         "processed_at": a.processed_at.isoformat() if a.processed_at else None,
     }

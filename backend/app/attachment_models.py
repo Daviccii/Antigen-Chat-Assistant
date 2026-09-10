@@ -17,6 +17,7 @@ from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
 
 from .db import Base
+from .security_models import TrustLevel
 
 
 class AttachmentType(str, enum.Enum):
@@ -57,6 +58,11 @@ class Attachment(Base):
 
     status = Column(SQLEnum(AttachmentStatus), default=AttachmentStatus.UPLOADED, nullable=False, index=True)
 
+    # Every upload is UNTRUSTED by default per the Security Gateway's
+    # trust model (see security_gateway.classify_upload_trust) — readable
+    # and analyzable, never something a capability can auto-execute.
+    trust_level = Column(SQLEnum(TrustLevel), default=TrustLevel.UNTRUSTED, nullable=False, index=True)
+
     # Populated by the Phase C2+ extraction pipeline.
     extracted_text = Column(Text, nullable=True)
     extracted_metadata = Column(Text, nullable=True)  # JSON string: page count, dimensions, duration, etc.
@@ -71,9 +77,3 @@ class Attachment(Base):
     user = relationship("User")
     conversation = relationship("Conversation")
     message = relationship("Message")
-
-
-Index("ix_attachments_user_id", Attachment.user_id)
-Index("ix_attachments_conversation_id", Attachment.conversation_id)
-Index("ix_attachments_status", Attachment.status)
-Index("ix_attachments_checksum", Attachment.checksum_sha256)

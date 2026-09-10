@@ -25,11 +25,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class PermissionLevel(str, Enum):
-    """Permission levels for tool execution."""
-    READ_ONLY = "READ_ONLY"
-    SAFE_ACTION = "SAFE_ACTION"
-    REQUIRES_CONFIRMATION = "REQUIRES_CONFIRMATION"
-    RESTRICTED = "RESTRICTED"
+    """Risk tiers for tool execution, gated by the Security Gateway.
+
+    Confirmation/authorization behavior is a function of the level (see
+    security_gateway.py's CONFIRMATION_POLICY) rather than its own enum
+    value — REQUIRES_CONFIRMATION (Phase A/B3) is retired in favor of
+    that: MODIFY may need confirmation depending on the operation,
+    DESTRUCTIVE always does, ADMIN needs explicit authorization, and
+    RESTRICTED is blocked outright regardless of confirmation.
+    """
+    READ_ONLY = "READ_ONLY"                # list/search/inspect — no gate
+    SAFE_ACTION = "SAFE_ACTION"             # open a file, launch an approved app — usually automatic
+    MODIFY = "MODIFY"                       # create/edit/rename/move a file, install a package
+    DESTRUCTIVE = "DESTRUCTIVE"             # delete files, terminate processes — confirmation required
+    ADMIN = "ADMIN"                         # services, firewall, registry, protected dirs — explicit authorization
+    RESTRICTED = "RESTRICTED"               # disabling security, credential extraction — blocked by default
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +79,10 @@ class Tool:
         permission_hierarchy = {
             PermissionLevel.READ_ONLY: 0,
             PermissionLevel.SAFE_ACTION: 1,
-            PermissionLevel.REQUIRES_CONFIRMATION: 2,
-            PermissionLevel.RESTRICTED: 3
+            PermissionLevel.MODIFY: 2,
+            PermissionLevel.DESTRUCTIVE: 3,
+            PermissionLevel.ADMIN: 4,
+            PermissionLevel.RESTRICTED: 5
         }
         return permission_hierarchy.get(user_permission_level, 0) >= permission_hierarchy.get(self.permission_level, 0)
 
@@ -333,8 +345,20 @@ class TaskOrchestrator:
         
         return plan
     
-    def execute_step(self, step: TaskStep) -> ExecutionResult:
-        """Execute a single task step."""
+    def execute_step(self, step: TaskStep, executor: Optional[Callable[[Tool, Dict[str, Any]], "ExecutionResult"]] = None) -> ExecutionResult:
+        """Execute a single task step.
+
+        `executor`, when provided, should be gated_execution.execute_tool_gated
+        bound to a db session and user_id (e.g. via functools.partial or a
+        small lambda) — that's what actually routes this through the
+        Security Gateway. This module intentionally has no DB/gateway
+        imports of its own (kept decoupled, same as before this phase),
+        so the caller is responsible for passing a gated executor.
+        Callers that omit it get the old direct-call behavior, which
+        bypasses the gateway entirely — every real call site in this
+        codebase now passes one; only tests/scripts should rely on the
+        fallback.
+        """
         tool = self.tool_registry.get(step.tool_name)
         
         if not tool:
@@ -349,6 +373,13 @@ class TaskOrchestrator:
                 error=f"Tool '{step.tool_name}' has no execution handler"
             )
         
+        if executor:
+            return executor(tool, step.input_data)
+        
+        logger.warning(
+            f"execute_step('{step.tool_name}') called with no executor — "
+            "running ungated, bypassing the Security Gateway entirely."
+        )
         try:
             import time
             start_time = time.time()
@@ -370,8 +401,10 @@ class TaskOrchestrator:
                 error=str(e)
             )
     
-    def execute_task(self, task: Task) -> ExecutionResult:
-        """Execute a task following its plan."""
+    def execute_task(self, task: Task, executor: Optional[Callable[[Tool, Dict[str, Any]], "ExecutionResult"]] = None) -> ExecutionResult:
+        """Execute a task following its plan. See execute_step for what
+        `executor` should be — it's threaded straight through to every step.
+        """
         if not task.plan:
             return ExecutionResult(
                 success=False,
@@ -382,14 +415,16 @@ class TaskOrchestrator:
         
         try:
             for step in task.plan.get_pending_steps():
-                # Check if confirmation is required
-                if step.permission_level == PermissionLevel.REQUIRES_CONFIRMATION:
+                # Real permission gating (allowed-areas, kill switch, audit
+                # logging) now happens inside the executor passed in — see
+                # gated_execution.execute_tool_gated. This in-memory check
+                # is a fast pre-filter only; MODIFY/DESTRUCTIVE/ADMIN steps
+                # still get re-evaluated for real by the gateway below.
+                if step.permission_level in (PermissionLevel.MODIFY, PermissionLevel.DESTRUCTIVE, PermissionLevel.ADMIN):
                     task.update_status(TaskStatus.WAITING_CONFIRMATION)
-                    # In a real implementation, this would wait for user confirmation
-                    # For now, we'll proceed with a warning
-                    logger.warning(f"Step {step.step_id} requires confirmation, proceeding automatically")
+                    logger.info(f"Step {step.step_id} ({step.permission_level.value}) will be evaluated for confirmation by the Security Gateway")
                 
-                result = self.execute_step(step)
+                result = self.execute_step(step, executor=executor)
                 
                 if result.success:
                     step.completed = True

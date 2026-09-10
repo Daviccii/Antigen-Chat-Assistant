@@ -17,6 +17,7 @@ from .capability_system import (
     Task, TaskStatus, PermissionLevel, capability_config,
     integrate_with_context_engine, integrate_with_memory_service
 )
+from .gated_execution import execute_tool_gated
 from .auth import get_current_active_user
 from .models import User
 from .db import SessionLocal
@@ -301,8 +302,13 @@ async def execute_task(
                 "message": "Task planned but not executed. Set auto_execute=true to execute."
             }
         
-        # Execute the task
-        result = task_orchestrator.execute_task(task)
+        # Execute the task, routed through the Security Gateway — every
+        # step's tool call goes through execute_tool_gated, bound to this
+        # request's db session and user, rather than running ungated.
+        def bound_executor(tool, input_data):
+            return execute_tool_gated(db, current_user.id, tool, input_data)
+
+        result = task_orchestrator.execute_task(task, executor=bound_executor)
         
         # Store successful results in memory
         if result.success:
@@ -339,32 +345,30 @@ async def execute_tool_directly(
     current_user: User = Depends(get_current_active_user)
 ):
     """Execute a tool directly with provided input data."""
+    db = SessionLocal()
     try:
         tool = tool_registry.get(tool_name)
         
         if not tool:
             raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
         
-        # Check permission level
-        if tool.permission_level == PermissionLevel.RESTRICTED:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Tool '{tool_name}' requires restricted permission level"
-            )
-        
-        if not tool.execution_handler:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Tool '{tool_name}' has no execution handler"
-            )
-        
-        # Execute the tool
-        result = tool.execution_handler(input_data)
-        
+        # Everything past this point — kill switch, category switch,
+        # allowed-areas, RESTRICTED hard-block, audit logging — is
+        # decided by the Security Gateway inside execute_tool_gated, not
+        # here. This endpoint used to call tool.execution_handler
+        # directly with only a coarse RESTRICTED check; that's gone now.
+        result = execute_tool_gated(db, current_user.id, tool, input_data)
+
+        if not result.success:
+            status_code = 403 if "Blocked by Security Gateway" in (result.error or "") else 500
+            if result.metadata.get("needs_confirmation"):
+                status_code = 409
+            raise HTTPException(status_code=status_code, detail=result.error)
+
         return {
             "tool": tool_name,
             "success": True,
-            "result": result
+            "result": result.data
         }
     
     except HTTPException:
@@ -372,3 +376,5 @@ async def execute_tool_directly(
     except Exception as e:
         logger.exception(f"Error executing tool {tool_name}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()

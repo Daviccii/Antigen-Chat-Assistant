@@ -51,13 +51,6 @@ class Message(Base):
     conversation = relationship("Conversation", back_populates="messages")
 
 
-# Indexes to support common queries: by conversation, created_at, and text searches
-Index("ix_messages_conversation_id", Message.conversation_id)
-Index("ix_messages_created_at", Message.created_at)
-Index("ix_conversations_created_at", Conversation.created_at)
-Index("ix_conversations_user_id", Conversation.user_id)
-
-
 class Memory(Base):
     __tablename__ = "memories"
     id = Column(Integer, primary_key=True, index=True)
@@ -93,18 +86,6 @@ class Memory(Base):
     extra_metadata = Column(Text, nullable=True)  # JSON string for flexible additional data
     
     user = relationship("User", back_populates="memories")
-
-
-# Indexes for memories
-Index("ix_memories_type", Memory.type)
-Index("ix_memories_category", Memory.category)
-Index("ix_memories_key", Memory.key)
-Index("ix_memories_created_at", Memory.created_at)
-Index("ix_memories_user_id", Memory.user_id)
-Index("ix_memories_project_id", Memory.project_id)
-Index("ix_memories_importance", Memory.importance)
-Index("ix_memories_status", Memory.status)
-Index("ix_memories_source", Memory.source)
 
 
 class Project(Base):
